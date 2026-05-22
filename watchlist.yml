@@ -1,19 +1,4 @@
-tickers: []
-
-# Add tickers here. Each entry requires:
-#   ticker: symbol (US: raw, e.g. GOOG; SG: base symbol without :SES, e.g. D05)
-#   market: US or SG
-#   added:  YYYY-MM-DD
-
-# Examples (uncomment to use):
-#  - ticker: GOOG
-#    market: US
-#    added: 2026-05-22
-#
-#  - ticker: AAPL
-#    market: US
-#    added: 2026-05-22
-#
-#  - ticker: D05
-#    market: SG
-#    added: 2026-05-22
+tickers:
+  - ticker: AAPL
+    market: US
+    added: 2026-05-22
