@@ -217,6 +217,18 @@ class _LibsqlBackend:
             stmt["args"] = args
         return {"type": "execute", "stmt": stmt}
 
+    def _parse_cell(self, cell: dict):
+        """Convert a Turso cell dict to the appropriate Python type."""
+        t = cell.get("type", "text")
+        v = cell.get("value")
+        if t == "null" or v is None:
+            return None
+        if t == "integer":
+            return int(v)
+        if t == "float":
+            return float(v)
+        return v  # text, blob
+
     def _rows_from_result(self, result: dict) -> list[dict]:
         """Parse a pipeline result into a list of row dicts."""
         if result.get("type") == "error":
@@ -225,7 +237,7 @@ class _LibsqlBackend:
         cols = [c["name"] for c in rs.get("cols", [])]
         rows = []
         for row in rs.get("rows", []):
-            rows.append(dict(zip(cols, (c.get("value") for c in row))))
+            rows.append(dict(zip(cols, (self._parse_cell(c) for c in row))))
         return rows
 
     def execute(self, sql: str, params: list[Any] | None = None) -> list[dict]:
@@ -236,9 +248,12 @@ class _LibsqlBackend:
     def executemany(self, sql: str, param_list: list[list[Any]]) -> None:
         if not param_list:
             return
-        requests_payload = [self._to_stmt(sql, p) for p in param_list]
-        requests_payload.append({"type": "close"})
-        self._pipeline(requests_payload)
+        _CHUNK = 100
+        for i in range(0, len(param_list), _CHUNK):
+            chunk = param_list[i : i + _CHUNK]
+            requests_payload = [self._to_stmt(sql, p) for p in chunk]
+            requests_payload.append({"type": "close"})
+            self._pipeline(requests_payload)
 
     def execute_script(self, script: str) -> None:
         stmts = [s.strip() for s in script.split(";") if s.strip()]
