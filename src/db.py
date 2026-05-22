@@ -150,45 +150,106 @@ class _Sqlite3Backend:
 
 
 class _LibsqlBackend:
-    """Wrapper around libsql_client.ClientSync."""
+    """
+    Turso backend using the HTTP pipeline API.
+
+    Replaces the libsql_client WebSocket backend which has compatibility
+    issues with Python 3.14+. Uses plain HTTPS requests instead — no
+    aiohttp, no WebSockets, no async runtime required.
+
+    API reference: https://docs.turso.tech/sdk/http/reference
+    """
 
     def __init__(self, url: str, auth_token: str) -> None:
-        self._url = url
+        # Convert libsql:// → https://
+        self._base_url = url.replace("libsql://", "https://").rstrip("/")
         self._auth_token = auth_token
-        self._client: Any = None
+        self._connected = False
 
     def connect(self) -> None:
-        import libsql_client
-        self._client = libsql_client.create_client_sync(
-            url=self._url,
-            auth_token=self._auth_token,
+        """Verify connectivity by running a no-op pipeline request."""
+        import requests as _req
+        resp = _req.post(
+            f"{self._base_url}/v2/pipeline",
+            headers={"Authorization": f"Bearer {self._auth_token}",
+                     "Content-Type": "application/json"},
+            json={"requests": [{"type": "close"}]},
+            timeout=15,
         )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Turso connection failed: HTTP {resp.status_code} — {resp.text[:200]}"
+            )
+        self._connected = True
+
+    def _pipeline(self, requests_payload: list[dict]) -> list[dict]:
+        """Execute a pipeline of statements and return result sets."""
+        import requests as _req
+        resp = _req.post(
+            f"{self._base_url}/v2/pipeline",
+            headers={"Authorization": f"Bearer {self._auth_token}",
+                     "Content-Type": "application/json"},
+            json={"requests": requests_payload},
+            timeout=30,
+        )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Turso pipeline error: HTTP {resp.status_code} — {resp.text[:300]}"
+            )
+        return resp.json().get("results", [])
+
+    def _to_stmt(self, sql: str, params: list | None) -> dict:
+        """Convert SQL + params into a Turso pipeline execute request."""
+        stmt: dict = {"sql": sql}
+        if params:
+            args = []
+            for p in params:
+                if p is None:
+                    args.append({"type": "null", "value": None})
+                elif isinstance(p, bool):
+                    args.append({"type": "integer", "value": str(int(p))})
+                elif isinstance(p, int):
+                    args.append({"type": "integer", "value": str(p)})
+                elif isinstance(p, float):
+                    args.append({"type": "float", "value": p})
+                else:
+                    args.append({"type": "text", "value": str(p)})
+            stmt["args"] = args
+        return {"type": "execute", "stmt": stmt}
+
+    def _rows_from_result(self, result: dict) -> list[dict]:
+        """Parse a pipeline result into a list of row dicts."""
+        if result.get("type") == "error":
+            raise RuntimeError(f"Turso SQL error: {result.get('error', result)}")
+        rs = result.get("response", {}).get("result", {})
+        cols = [c["name"] for c in rs.get("cols", [])]
+        rows = []
+        for row in rs.get("rows", []):
+            rows.append(dict(zip(cols, (c.get("value") for c in row))))
+        return rows
 
     def execute(self, sql: str, params: list[Any] | None = None) -> list[dict]:
-        assert self._client is not None, "Not connected"
-        if params:
-            rs = self._client.execute(sql, params)
-        else:
-            rs = self._client.execute(sql)
-        cols = rs.columns
-        return [dict(zip(cols, row)) for row in rs.rows]
+        stmt = self._to_stmt(sql, params)
+        results = self._pipeline([stmt, {"type": "close"}])
+        return self._rows_from_result(results[0]) if results else []
 
     def executemany(self, sql: str, param_list: list[list[Any]]) -> None:
-        assert self._client is not None
-        for params in param_list:
-            self._client.execute(sql, params)
+        if not param_list:
+            return
+        requests_payload = [self._to_stmt(sql, p) for p in param_list]
+        requests_payload.append({"type": "close"})
+        self._pipeline(requests_payload)
 
     def execute_script(self, script: str) -> None:
-        assert self._client is not None
-        # Split on semicolons, execute each statement individually
         stmts = [s.strip() for s in script.split(";") if s.strip()]
-        for stmt in stmts:
-            self._client.execute(stmt)
+        if not stmts:
+            return
+        requests_payload = [self._to_stmt(s, None) for s in stmts]
+        requests_payload.append({"type": "close"})
+        self._pipeline(requests_payload)
 
     def close(self) -> None:
-        if self._client:
-            self._client.close()
-            self._client = None
+        self._connected = False
 
 
 # ---------------------------------------------------------------------------
