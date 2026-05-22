@@ -1,0 +1,397 @@
+{
+  "tickers_tested": 5,
+  "alerts_generated": 26,
+  "errors": [],
+  "alert_log": [
+    {
+      "ticker": "GOOG",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 200,
+      "price": 328.42999,
+      "ma_value": 230.84059991499998,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 5,
+        "new_step": 4
+      },
+      "fired_at": "2026-05-22T14:19:47Z"
+    },
+    {
+      "ticker": "GOOG",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 150,
+      "price": 340.70001,
+      "ma_value": 260.38413338,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 4,
+        "new_step": 3
+      },
+      "fired_at": "2026-05-22T14:19:47Z"
+    },
+    {
+      "ticker": "GOOG",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 100,
+      "price": 309.37,
+      "ma_value": 295.9125996,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 3,
+        "new_step": 2
+      },
+      "fired_at": "2026-05-22T14:19:47Z"
+    },
+    {
+      "ticker": "GOOG",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 150,
+      "price": 315.72,
+      "ma_value": 293.74439938,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 4,
+        "new_step": 3
+      },
+      "fired_at": "2026-05-22T14:19:47Z"
+    },
+    {
+      "ticker": "GOOG",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 100,
+      "price": 330.47,
+      "ma_value": 314.8536987,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 3,
+        "new_step": 2
+      },
+      "fired_at": "2026-05-22T14:19:48Z"
+    },
+    {
+      "ticker": "GOOG",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 50,
+      "price": 381.94,
+      "ma_value": 312.62799796,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 2,
+        "new_step": 1
+      },
+      "fired_at": "2026-05-22T14:19:48Z"
+    },
+    {
+      "ticker": "AAPL",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 200,
+      "price": 248.039993,
+      "ma_value": 235.02434946000002,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 5,
+        "new_step": 4
+      },
+      "fired_at": "2026-05-22T14:19:56Z"
+    },
+    {
+      "ticker": "AAPL",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 150,
+      "price": 269.48001,
+      "ma_value": 248.8763990933333,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 4,
+        "new_step": 3
+      },
+      "fired_at": "2026-05-22T14:19:56Z"
+    },
+    {
+      "ticker": "AAPL",
+      "signal_type": "MA_SUPPORT",
+      "timeframe": "D",
+      "ma_period": 200,
+      "price": 247.99001,
+      "ma_value": 246.82304933,
+      "volume_ratio": 2.128798027349641,
+      "extra": {
+        "touch_count": 0,
+        "next_resistance_ma": null,
+        "next_resistance_value": null
+      },
+      "fired_at": "2026-05-22T14:19:56Z"
+    },
+    {
+      "ticker": "AAPL",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 200,
+      "price": 260.48999,
+      "ma_value": 250.33354913000002,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 5,
+        "new_step": 4
+      },
+      "fired_at": "2026-05-22T14:19:57Z"
+    },
+    {
+      "ticker": "AAPL",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 150,
+      "price": 273.42999,
+      "ma_value": 263.5439989866667,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 4,
+        "new_step": 3
+      },
+      "fired_at": "2026-05-22T14:19:57Z"
+    },
+    {
+      "ticker": "AAPL",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 100,
+      "price": 276.82999,
+      "ma_value": 263.78809892000004,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 3,
+        "new_step": 2
+      },
+      "fired_at": "2026-05-22T14:19:57Z"
+    },
+    {
+      "ticker": "AAPL",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 50,
+      "price": 298.87,
+      "ma_value": 264.67659912,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 2,
+        "new_step": 1
+      },
+      "fired_at": "2026-05-22T14:19:57Z"
+    },
+    {
+      "ticker": "NVDA",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 200,
+      "price": 187.67,
+      "ma_value": 165.70500046749999,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 5,
+        "new_step": 4
+      },
+      "fired_at": "2026-05-22T14:20:05Z"
+    },
+    {
+      "ticker": "NVDA",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 150,
+      "price": 184.97,
+      "ma_value": 182.53160021000002,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 4,
+        "new_step": 3
+      },
+      "fired_at": "2026-05-22T14:20:06Z"
+    },
+    {
+      "ticker": "NVDA",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 200,
+      "price": 198.35001,
+      "ma_value": 181.53175022750003,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 5,
+        "new_step": 4
+      },
+      "fired_at": "2026-05-22T14:20:06Z"
+    },
+    {
+      "ticker": "NVDA",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 150,
+      "price": 216.61,
+      "ma_value": 185.63053344666667,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 4,
+        "new_step": 3
+      },
+      "fired_at": "2026-05-22T14:20:06Z"
+    },
+    {
+      "ticker": "NVDA",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 100,
+      "price": 207.83,
+      "ma_value": 186.41949988,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 3,
+        "new_step": 2
+      },
+      "fired_at": "2026-05-22T14:20:06Z"
+    },
+    {
+      "ticker": "NVDA",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 50,
+      "price": 225.32001,
+      "ma_value": 193.07119998000002,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 2,
+        "new_step": 1
+      },
+      "fired_at": "2026-05-22T14:20:06Z"
+    },
+    {
+      "ticker": "AXON",
+      "signal_type": "MA_SUPPORT",
+      "timeframe": "W",
+      "ma_period": 200,
+      "price": 385.85999,
+      "ma_value": 383.57440041999996,
+      "volume_ratio": 1.9340615809892054,
+      "extra": {
+        "touch_count": 1,
+        "next_resistance_ma": null,
+        "next_resistance_value": null
+      },
+      "fired_at": "2026-05-22T14:20:18Z"
+    },
+    {
+      "ticker": "AXON",
+      "signal_type": "MA_SUPPORT",
+      "timeframe": "W",
+      "ma_period": 200,
+      "price": 426.89001,
+      "ma_value": 383.57440041999996,
+      "volume_ratio": 2.163856847086661,
+      "extra": {
+        "touch_count": 2,
+        "next_resistance_ma": null,
+        "next_resistance_value": null
+      },
+      "fired_at": "2026-05-22T14:20:18Z"
+    },
+    {
+      "ticker": "CLS",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 200,
+      "price": 303.089996,
+      "ma_value": 215.032950265,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 5,
+        "new_step": 4
+      },
+      "fired_at": "2026-05-22T14:20:26Z"
+    },
+    {
+      "ticker": "CLS",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 150,
+      "price": 297.45001,
+      "ma_value": 259.55700048666665,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 4,
+        "new_step": 3
+      },
+      "fired_at": "2026-05-22T14:20:26Z"
+    },
+    {
+      "ticker": "CLS",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 150,
+      "price": 351.31,
+      "ma_value": 290.8109336,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 4,
+        "new_step": 3
+      },
+      "fired_at": "2026-05-22T14:20:27Z"
+    },
+    {
+      "ticker": "CLS",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 100,
+      "price": 403.029999,
+      "ma_value": 304.11040019,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 3,
+        "new_step": 2
+      },
+      "fired_at": "2026-05-22T14:20:27Z"
+    },
+    {
+      "ticker": "CLS",
+      "signal_type": "RECLAIM",
+      "timeframe": "D",
+      "ma_period": 50,
+      "price": 409.59,
+      "ma_value": 313.85960058,
+      "volume_ratio": null,
+      "extra": {
+        "streak": 7,
+        "previous_step": 2,
+        "new_step": 1
+      },
+      "fired_at": "2026-05-22T14:20:27Z"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+[
+  "tests/test_signals.py::TestDetect3AMaSupport::test_does_not_fire_when_close_below_ma",
+  "tests/test_signals.py::TestDetect3AMaSupport::test_does_not_fire_when_volume_below_threshold",
+  "tests/test_signals.py::TestDetect3AMaSupport::test_does_not_fire_without_wick",
+  "tests/test_signals.py::TestDetect3AMaSupport::test_fires_when_all_conditions_met",
+  "tests/test_signals.py::TestDetect3AMaSupport::test_insufficient_history_no_crash",
+  "tests/test_signals.py::TestDetect3AMaSupport::test_proximity_rule_only_highest_ma_fires",
+  "tests/test_signals.py::TestDetect3BReclaim::test_does_not_fire_at_streak_6",
+  "tests/test_signals.py::TestDetect3BReclaim::test_fires_on_day_7",
+  "tests/test_signals.py::TestDetect3BReclaim::test_new_3b_after_break_and_rereclaim",
+  "tests/test_signals.py::TestDetect3BReclaim::test_no_signal_when_broken_ma_is_none",
+  "tests/test_signals.py::TestDetect3BReclaim::test_streak_increments_on_close_above",
+  "tests/test_signals.py::TestDetect3BReclaim::test_streak_resets_on_close_below",
+  "tests/test_signals.py::TestDetect3CTouchAccumulation::test_3c_fires_independently_of_3a_volume",
+  "tests/test_signals.py::TestDetect3CTouchAccumulation::test_does_not_fire_at_2_touches",
+  "tests/test_signals.py::TestDetect3CTouchAccumulation::test_fires_at_3_touches",
+  "tests/test_signals.py::TestDetect3CTouchAccumulation::test_old_touches_outside_window_not_counted",
+  "tests/test_signals.py::TestDetect3CTouchAccumulation::test_touch_log_not_cleared_after_firing",
+  "tests/test_signals.py::TestSignalOrdering::test_3a_touch_feeds_3c"
+]

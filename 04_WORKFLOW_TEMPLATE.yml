@@ -1,0 +1,64 @@
+name: Daily MA Alert Scan
+
+on:
+  schedule:
+    # US close: 22:30 UTC (1.5h after 16:00 EST in winter, 2.5h after 16:00 EDT in summer)
+    - cron: '30 22 * * 1-5'
+    # SG close: 10:30 UTC (~1.5h after 17:00 SGT close, no DST)
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      market:
+        description: 'Market to scan'
+        required: true
+        type: choice
+        options:
+          - US
+          - SG
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Determine market from cron
+        id: detect-market
+        run: |
+          # If manually triggered, use the input; otherwise infer from cron schedule
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "market=${{ github.event.inputs.market }}" >> $GITHUB_OUTPUT
+          else
+            # Cron-triggered. Use the hour to pick market.
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" = "22" ]; then
+              echo "market=US" >> $GITHUB_OUTPUT
+            else
+              echo "market=SG" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Run scan
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          TURSO_DATABASE_URL:  ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN:    ${{ secrets.TURSO_AUTH_TOKEN }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOG_LEVEL:           INFO
+        run: |
+          python -m src.runner --market ${{ steps.detect-market.outputs.market }}

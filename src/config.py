@@ -1,0 +1,52 @@
+"""
+config.py — Single source of truth for all tunable parameters.
+
+Do not import from other src modules here. This module must have zero
+dependencies on the rest of the package so it can be imported anywhere safely.
+"""
+
+# ---------------------------------------------------------------------------
+# Moving Average periods (applied to Daily, Weekly, Monthly timeframes)
+# ---------------------------------------------------------------------------
+MA_PERIODS: list[int] = [50, 100, 150, 200]
+
+# ---------------------------------------------------------------------------
+# Signal thresholds
+# ---------------------------------------------------------------------------
+VOLUME_MULTIPLIER: float = 1.5          # 3A: volume >= 1.5 × 20-day daily avg
+VOLUME_LOOKBACK_DAYS: int = 20          # Always daily, regardless of signal timeframe
+RECLAIM_STREAK_DAYS: int = 7            # 3B: consecutive closes above broken MA
+TOUCH_THRESHOLD: int = 3               # 3C: qualifying touches required
+TOUCH_WINDOW_DAYS: int = 21            # 3C: rolling window in CALENDAR days (~15 trading days)
+
+# ---------------------------------------------------------------------------
+# Cascade thresholds — which Daily MA period defines each cascade step
+# ---------------------------------------------------------------------------
+CASCADE_MA_BY_STEP: dict[int, int] = {
+    2: 50,
+    3: 100,
+    4: 150,
+    5: 200,
+}
+
+# ---------------------------------------------------------------------------
+# MAs evaluated at each cascade step.
+# Format: list of (timeframe, period) tuples.
+# Timeframes: "D" = Daily, "W" = Weekly, "M" = Monthly.
+# ---------------------------------------------------------------------------
+CASCADE_CHECKS: dict[int, list[tuple[str, int]]] = {
+    1: [("D", 50)],
+    2: [("D", 100), ("W", 50), ("W", 100), ("M", 50)],
+    3: [("D", 150), ("W", 50), ("W", 100), ("M", 50), ("M", 100)],
+    4: [("D", 200), ("W", 100), ("W", 150), ("W", 200), ("M", 100), ("M", 150)],
+    5: [("W", 100), ("W", 150), ("W", 200), ("M", 100), ("M", 150), ("M", 200)],
+}
+
+# ---------------------------------------------------------------------------
+# Data layer constants
+# ---------------------------------------------------------------------------
+BOOTSTRAP_DAYS: int = 250              # Minimum acceptable history for a new ticker
+BOOTSTRAP_MAX_CANDLES: int = 5000      # outputsize passed to Twelve Data — fetch max available
+OHLCV_RETENTION_YEARS: int = 5         # OHLCV rows older than this are pruned
+HALT_FAILURE_THRESHOLD: int = 3        # Send Telegram warning after N consecutive fetch failures
+HALT_WARNING_RESEND_DAYS: int = 7      # Minimum days between repeated halt warnings per ticker

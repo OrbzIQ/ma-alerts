@@ -1,0 +1,79 @@
+-- MA Alerts — Turso/SQLite Schema
+-- Run on first init. All statements use IF NOT EXISTS for idempotency.
+
+CREATE TABLE IF NOT EXISTS watchlist (
+    ticker          TEXT NOT NULL PRIMARY KEY,
+    market          TEXT NOT NULL CHECK (market IN ('US', 'SG')),
+    added_at        DATE NOT NULL,
+    active          INTEGER NOT NULL DEFAULT 1     -- boolean
+);
+
+CREATE TABLE IF NOT EXISTS ohlcv (
+    ticker          TEXT NOT NULL,
+    date            DATE NOT NULL,
+    open            REAL NOT NULL,
+    high            REAL NOT NULL,
+    low             REAL NOT NULL,
+    close           REAL NOT NULL,
+    volume          INTEGER NOT NULL,
+    PRIMARY KEY (ticker, date),
+    FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ohlcv_ticker_date ON ohlcv(ticker, date DESC);
+
+CREATE TABLE IF NOT EXISTS cascade_state (
+    ticker          TEXT NOT NULL PRIMARY KEY,
+    current_step    INTEGER NOT NULL CHECK (current_step BETWEEN 1 AND 5),
+    broken_ma       TEXT NOT NULL CHECK (broken_ma IN ('NONE', 'D50', 'D100', 'D150', 'D200')),
+    last_updated    DATE NOT NULL,
+    FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
+);
+
+CREATE TABLE IF NOT EXISTS reclaim_tracker (
+    ticker              TEXT NOT NULL,
+    ma_period           INTEGER NOT NULL,            -- e.g. 50, 100, 150, 200
+    consecutive_closes  INTEGER NOT NULL DEFAULT 0,
+    streak_start        DATE,                        -- nullable; null when streak == 0
+    last_updated        DATE NOT NULL,
+    PRIMARY KEY (ticker, ma_period),
+    FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
+);
+
+CREATE TABLE IF NOT EXISTS touch_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker          TEXT NOT NULL,
+    timeframe       TEXT NOT NULL CHECK (timeframe IN ('D', 'W', 'M')),
+    ma_period       INTEGER NOT NULL,
+    touch_date      DATE NOT NULL,
+    FOREIGN KEY (ticker) REFERENCES watchlist(ticker),
+    UNIQUE (ticker, timeframe, ma_period, touch_date)   -- prevent duplicate touch records
+);
+
+CREATE INDEX IF NOT EXISTS idx_touch_lookup
+  ON touch_log(ticker, timeframe, ma_period, touch_date DESC);
+
+CREATE TABLE IF NOT EXISTS alert_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker          TEXT NOT NULL,
+    signal_type     TEXT NOT NULL CHECK (signal_type IN ('MA_SUPPORT', 'RECLAIM', 'TOUCH_ACCUMULATION', 'HALT_WARNING')),
+    timeframe       TEXT CHECK (timeframe IN ('D', 'W', 'M', NULL)),
+    ma_period       INTEGER,
+    price_at_fire   REAL,
+    ma_value        REAL,
+    volume_ratio    REAL,
+    extra_json      TEXT,                         -- signal-specific fields as JSON
+    fired_at        TEXT NOT NULL,                -- UTC ISO 8601
+    FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_log_ticker_time
+  ON alert_log(ticker, fired_at DESC);
+
+CREATE TABLE IF NOT EXISTS data_health (
+    ticker                  TEXT NOT NULL PRIMARY KEY,
+    last_success            DATE,
+    consecutive_failures    INTEGER NOT NULL DEFAULT 0,
+    last_warning_sent       DATE,                  -- nullable
+    FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
+);
