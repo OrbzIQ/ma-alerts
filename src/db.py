@@ -248,7 +248,7 @@ class _LibsqlBackend:
     def executemany(self, sql: str, param_list: list[list[Any]]) -> None:
         if not param_list:
             return
-        _CHUNK = 100
+        _CHUNK = 250
         for i in range(0, len(param_list), _CHUNK):
             chunk = param_list[i : i + _CHUNK]
             requests_payload = [self._to_stmt(sql, p) for p in chunk]
