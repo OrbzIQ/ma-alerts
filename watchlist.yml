@@ -2,3 +2,126 @@ tickers:
   - ticker: AAPL
     market: US
     added: 2026-05-22
+  - ticker: APH
+    market: US
+    added: 2026-05-22
+  - ticker: CLS
+    market: US
+    added: 2026-05-22
+  - ticker: ANET
+    market: US
+    added: 2026-05-22
+  - ticker: AMZN
+    market: US
+    added: 2026-05-22
+  - ticker: MSFT
+    market: US
+    added: 2026-05-22
+  - ticker: CRWD
+    market: US
+    added: 2026-05-22
+  - ticker: PANW
+    market: US
+    added: 2026-05-22
+  - ticker: FTNT
+    market: US
+    added: 2026-05-22
+  - ticker: RKLB
+    market: US
+    added: 2026-05-22
+  - ticker: AXON
+    market: US
+    added: 2026-05-22
+  - ticker: META
+    market: US
+    added: 2026-05-22
+  - ticker: MA
+    market: US
+    added: 2026-05-22
+  - ticker: V
+    market: US
+    added: 2026-05-22
+  - ticker: GLW
+    market: US
+    added: 2026-05-22
+  - ticker: SPGI
+    market: US
+    added: 2026-05-22
+  - ticker: CEG
+    market: US
+    added: 2026-05-22
+  - ticker: GOOG
+    market: US
+    added: 2026-05-22
+  - ticker: ETN
+    market: US
+    added: 2026-05-22
+  - ticker: LITE
+    market: US
+    added: 2026-05-22
+  - ticker: MRVL
+    market: US
+    added: 2026-05-22
+  - ticker: COHR
+    market: US
+    added: 2026-05-22
+  - ticker: NFLX
+    market: US
+    added: 2026-05-22
+  - ticker: GE
+    market: US
+    added: 2026-05-22
+  - ticker: TSM
+    market: US
+    added: 2026-05-22
+  - ticker: NVDA
+    market: US
+    added: 2026-05-22
+  - ticker: MELI
+    market: US
+    added: 2026-05-22
+  - ticker: OSCR
+    market: US
+    added: 2026-05-22
+  - ticker: APLD
+    market: US
+    added: 2026-05-22
+  - ticker: SYM
+    market: US
+    added: 2026-05-22
+  - ticker: NBIS
+    market: US
+    added: 2026-05-22
+  - ticker: UNH
+    market: US
+    added: 2026-05-22
+  - ticker: JPM
+    market: US
+    added: 2026-05-22
+  - ticker: GS
+    market: US
+    added: 2026-05-22
+  - ticker: VRT
+    market: US
+    added: 2026-05-22
+  - ticker: NET
+    market: US
+    added: 2026-05-22
+  - ticker: AXP
+    market: US
+    added: 2026-05-22
+  - ticker: EL
+    market: US
+    added: 2026-05-22
+  - ticker: GLD
+    market: US
+    added: 2026-05-22
+  - ticker: SLV
+    market: US
+    added: 2026-05-22
+  - ticker: PLTR
+    market: US
+    added: 2026-05-22
+  - ticker: AVGO
+    market: US
+    added: 2026-05-22
