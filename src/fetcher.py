@@ -6,14 +6,16 @@ Symbol conventions:
   - SG tickers: append ':SES' suffix (e.g. 'D05' → 'D05:SES')
 
 Rate limiting:
-  - Free tier: 8 calls/minute. Bulk helper sleeps 7.5s between calls.
+  - Free tier: 8 calls/minute. Sliding-window rate limiter in _wait_for_rate_limit().
   - Daily ceiling: 800 calls/day. 60 tickers × 1 call = 60 calls, well within budget.
+  - 429 responses are retried up to MAX_RETRIES_ON_429 times with RETRY_BACKOFF_SECONDS delay.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from typing import Any
 
 import requests
@@ -25,7 +27,31 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _TWELVE_DATA_BASE = "https://api.twelvedata.com"
-_RATE_LIMIT_SLEEP = 7.5   # seconds between calls in bulk mode (8 calls/min ceiling)
+
+# Sliding-window rate limiter for Twelve Data free tier (8 calls / 60s)
+_RATE_LIMIT_CALLS = 8
+_RATE_LIMIT_WINDOW = 60.0       # seconds
+_RATE_LIMIT_BUFFER = 2.0        # extra safety margin in seconds
+_call_timestamps: deque[float] = deque(maxlen=_RATE_LIMIT_CALLS)
+
+# 429 retry config
+MAX_RETRIES_ON_429 = 3
+RETRY_BACKOFF_SECONDS = 65      # full minute + buffer
+
+
+def _wait_for_rate_limit() -> None:
+    """Block until making one more call would stay under 8/60s."""
+    now = time.monotonic()
+    if len(_call_timestamps) < _RATE_LIMIT_CALLS:
+        _call_timestamps.append(now)
+        return
+    oldest = _call_timestamps[0]
+    age = now - oldest
+    if age < _RATE_LIMIT_WINDOW:
+        sleep_for = (_RATE_LIMIT_WINDOW - age) + _RATE_LIMIT_BUFFER
+        logger.info("Rate limit pause: sleeping %.1fs", sleep_for)
+        time.sleep(sleep_for)
+    _call_timestamps.append(time.monotonic())
 
 
 def _api_key() -> str:
@@ -82,24 +108,39 @@ def fetch_daily_ohlcv(
         "apikey": _api_key(),
     }
 
-    try:
-        response = requests.get(
-            f"{_TWELVE_DATA_BASE}/time_series",
-            params=params,
-            timeout=30,
-        )
-    except requests.RequestException as exc:
-        logger.error("Network error fetching %s (%s): %s", ticker, symbol, exc)
-        return None
+    url = f"{_TWELVE_DATA_BASE}/time_series"
+    response = None
 
-    if response.status_code != 200:
-        logger.error(
-            "HTTP %d fetching %s (%s): %s",
-            response.status_code,
-            ticker,
-            symbol,
-            response.text[:200],
-        )
+    for attempt in range(MAX_RETRIES_ON_429):
+        _wait_for_rate_limit()
+        try:
+            response = requests.get(url, params=params, timeout=30)
+        except requests.RequestException as exc:
+            logger.error("Network error fetching %s (%s): %s", ticker, symbol, exc)
+            return None
+
+        if response.status_code == 429:
+            logger.warning(
+                "Rate limit hit for %s (attempt %d/%d). Sleeping %ds before retry.",
+                ticker, attempt + 1, MAX_RETRIES_ON_429, RETRY_BACKOFF_SECONDS,
+            )
+            time.sleep(RETRY_BACKOFF_SECONDS)
+            _call_timestamps.clear()    # reset window after long sleep
+            continue
+
+        if response.status_code != 200:
+            logger.error(
+                "HTTP %d fetching %s (%s): %s",
+                response.status_code,
+                ticker,
+                symbol,
+                response.text[:200],
+            )
+            return None
+
+        break   # successful response
+    else:
+        logger.error("Twelve Data rate limit retries exhausted for %s", ticker)
         return None
 
     try:
@@ -159,7 +200,7 @@ def fetch_daily_ohlcv_bulk(
     """
     Batch wrapper. Returns dict mapping ticker → candle list (or None on failure).
 
-    Respects Twelve Data free-tier rate limit by sleeping 7.5s between calls.
+    Rate pacing is handled automatically by _wait_for_rate_limit() inside each call.
 
     Args:
         tickers:    List of (ticker, market) tuples.
@@ -167,9 +208,7 @@ def fetch_daily_ohlcv_bulk(
     """
     results: dict[str, list[dict] | None] = {}
 
-    for i, (ticker, market) in enumerate(tickers):
-        if i > 0:
-            time.sleep(_RATE_LIMIT_SLEEP)
+    for ticker, market in tickers:
         try:
             results[ticker] = fetch_daily_ohlcv(ticker, market, outputsize=outputsize)
         except ValueError as exc:
