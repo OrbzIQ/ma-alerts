@@ -6,14 +6,16 @@ dependencies on the rest of the package so it can be imported anywhere safely.
 """
 
 # ---------------------------------------------------------------------------
-# Moving Average periods (applied to Daily, Weekly, Monthly timeframes)
+# Moving Average periods
 # ---------------------------------------------------------------------------
-MA_PERIODS: list[int] = [50, 100, 150, 200]
+MA_PERIODS: list[int] = [50, 100, 150, 200]              # Weekly/Monthly (no D20)
+MA_PERIODS_DAILY: list[int] = [20, 50, 100, 150, 200]   # Daily — 20 added for V2 3D
 
 # ---------------------------------------------------------------------------
 # Signal thresholds
 # ---------------------------------------------------------------------------
-VOLUME_MULTIPLIER: float = 1.5          # 3A: volume >= 1.5 × 20-day daily avg
+VOLUME_MULTIPLIER: float = 1.5          # kept for backwards compat
+MOMENTUM_VOLUME_MULTIPLIER: float = 1.5 # used by 3A (refactored) and 3D
 VOLUME_LOOKBACK_DAYS: int = 20          # Always daily, regardless of signal timeframe
 RECLAIM_STREAK_DAYS: int = 7            # 3B: consecutive closes above broken MA
 TOUCH_THRESHOLD: int = 3               # 3C: qualifying touches required

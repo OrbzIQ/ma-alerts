@@ -85,7 +85,7 @@ CREATE INDEX IF NOT EXISTS idx_touch_lookup
 CREATE TABLE IF NOT EXISTS alert_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker          TEXT NOT NULL,
-    signal_type     TEXT NOT NULL CHECK (signal_type IN ('MA_SUPPORT', 'RECLAIM', 'TOUCH_ACCUMULATION', 'HALT_WARNING')),
+    signal_type     TEXT NOT NULL,
     timeframe       TEXT,
     ma_period       INTEGER,
     price_at_fire   REAL,
@@ -350,11 +350,67 @@ def _db() -> _Sqlite3Backend | _LibsqlBackend:
 # Schema
 # ---------------------------------------------------------------------------
 
+def _migrate_alert_log_v2() -> None:
+    """
+    V2 migration: remove the restrictive signal_type CHECK constraint from alert_log
+    so that new signal types (e.g. '3D') can be inserted.
+
+    SQLite/libsql does not support DROP CONSTRAINT, so we recreate the table.
+    The migration is idempotent: it reads the table DDL first and skips if the
+    constraint is already gone. Safe to run on every startup.
+    """
+    try:
+        rows = _db().execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_log'"
+        )
+    except Exception as exc:
+        logger.warning("V2 migration: could not read sqlite_master (%s) — skipping", exc)
+        return
+
+    if not rows:
+        return  # table doesn't exist yet; fresh _SCHEMA_SQL DDL will create it correctly
+
+    table_sql: str = (rows[0].get("sql") or "")
+    if "CHECK (signal_type IN" not in table_sql:
+        return  # already migrated or constraint was never present
+
+    logger.info("V2 migration: recreating alert_log to relax signal_type CHECK constraint")
+    try:
+        _db().execute_script("""
+            CREATE TABLE alert_log_v2 (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker          TEXT NOT NULL,
+                signal_type     TEXT NOT NULL,
+                timeframe       TEXT,
+                ma_period       INTEGER,
+                price_at_fire   REAL,
+                ma_value        REAL,
+                volume_ratio    REAL,
+                extra_json      TEXT,
+                fired_at        TEXT NOT NULL
+            );
+            INSERT INTO alert_log_v2
+                (id, ticker, signal_type, timeframe, ma_period,
+                 price_at_fire, ma_value, volume_ratio, extra_json, fired_at)
+            SELECT id, ticker, signal_type, timeframe, ma_period,
+                   price_at_fire, ma_value, volume_ratio, extra_json, fired_at
+            FROM alert_log;
+            DROP TABLE alert_log;
+            ALTER TABLE alert_log_v2 RENAME TO alert_log;
+            CREATE INDEX IF NOT EXISTS idx_alert_log_ticker_time
+              ON alert_log(ticker, fired_at DESC)
+        """)
+        logger.info("V2 migration complete — alert_log signal_type CHECK constraint removed")
+    except Exception as exc:
+        logger.error("V2 migration failed: %s", exc)
+
+
 def init_schema() -> None:
     """
     Run DDL to create all tables and indexes. Idempotent — safe to call on every run.
     """
     _db().execute_script(_SCHEMA_SQL)
+    _migrate_alert_log_v2()
     logger.info("Schema initialised (or already up to date)")
 
 

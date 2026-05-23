@@ -13,8 +13,9 @@ Pipeline per run:
        e. Compute DataFrames + MAs
        f. Load cascade state
        g. Detect forward transition → persist immediately, clear stale reclaim streak
-       h. Signal detectors in strict order: 3A → 3C → 3B
+       h. Signal detectors in strict order: 3A → 3C → 3B → 3D
           3B is skipped if a forward transition fired this run
+          3D is stateless — runs unconditionally after cascade state is final
        i. Collect alerts
   5. Collect halt warnings
   6. Dispatch all alerts
@@ -128,7 +129,7 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
     """
     import src.db as db
     from src.cascade import apply_reclaim_de_escalation, detect_forward_transition
-    from src.config import MA_PERIODS, OHLCV_RETENTION_YEARS
+    from src.config import MA_PERIODS, MA_PERIODS_DAILY, OHLCV_RETENTION_YEARS
     from src.fetcher import fetch_daily_ohlcv
     from src.health import update_after_fetch
     from src.ma import compute_ma
@@ -137,6 +138,7 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
         detect_3a_ma_support,
         detect_3b_reclaim,
         detect_3c_touch_accumulation,
+        detect_3d,
     )
 
     alerts: list[dict] = []
@@ -162,7 +164,7 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
             logger.warning("No OHLCV in DB for %s after upsert", ticker)
             return []
 
-        compute_ma(daily_df, MA_PERIODS)
+        compute_ma(daily_df, MA_PERIODS_DAILY)  # includes D20 for 3D signal
         weekly_df = resample_to_weekly(daily_df)
         compute_ma(weekly_df, MA_PERIODS)
         monthly_df = resample_to_monthly(daily_df)
@@ -204,7 +206,7 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
 
         cascade_step = cascade_state["current_step"]
 
-        # 4h. Signal detectors — STRICT ORDER: 3A → 3C → 3B
+        # 4h. Signal detectors — STRICT ORDER: 3A → 3C → 3B → 3D
         alerts.extend(
             detect_3a_ma_support(ticker, daily_df, weekly_df, monthly_df, cascade_step)
         )
@@ -224,6 +226,11 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
                         de_escalation["new_broken_ma"],
                     )
                 alerts.append(reclaim_alert)
+
+        # 3D: stateless, runs unconditionally; receives post-transition cascade_step
+        three_d = detect_3d(ticker, daily_df, cascade_step)
+        if three_d:
+            alerts.append(three_d)
 
     except Exception as exc:
         import traceback

@@ -23,11 +23,12 @@ import pandas as pd
 import src.db as db
 from src.config import (
     CASCADE_CHECKS,
+    MA_PERIODS_DAILY,
+    MOMENTUM_VOLUME_MULTIPLIER,
     RECLAIM_STREAK_DAYS,
     TOUCH_THRESHOLD,
     TOUCH_WINDOW_DAYS,
     VOLUME_LOOKBACK_DAYS,
-    VOLUME_MULTIPLIER,
 )
 from src.ma import latest_ma_value
 
@@ -63,10 +64,14 @@ def _get_timeframe_df(
 
 
 def _compute_avg_daily_volume(daily_df: pd.DataFrame) -> float | None:
-    """Return the 20-day average daily volume. Always uses daily bars."""
-    if daily_df.empty or len(daily_df) < VOLUME_LOOKBACK_DAYS:
+    """Return the 20-day average daily volume (excludes today). Always uses daily bars.
+
+    Uses iloc[-21:-1] — 20 bars ending yesterday — as the canonical slice (§A.1).
+    Requires at least VOLUME_LOOKBACK_DAYS + 1 rows (today + 20 history bars).
+    """
+    if daily_df.empty or len(daily_df) < VOLUME_LOOKBACK_DAYS + 1:
         return None
-    return float(daily_df["volume"].iloc[-VOLUME_LOOKBACK_DAYS:].mean())
+    return float(daily_df["volume"].iloc[-(VOLUME_LOOKBACK_DAYS + 1):-1].mean())
 
 
 def _get_proximity_winner(
@@ -245,7 +250,7 @@ def detect_3a_ma_support(
         else:
             today_volume = float(today_bar["volume"])
             vol_ratio = today_volume / avg_volume if avg_volume > 0 else 0.0
-            volume_ok = vol_ratio >= VOLUME_MULTIPLIER
+            volume_ok = vol_ratio >= MOMENTUM_VOLUME_MULTIPLIER
 
         if not (wick_touched and closed_above and volume_ok):
             logger.debug(
@@ -459,4 +464,111 @@ def detect_3c_touch_accumulation(
             )
 
     return alerts
+
+
+# ---------------------------------------------------------------------------
+# Signal 3D — D20 Momentum Touch
+# ---------------------------------------------------------------------------
+
+def detect_3d(
+    ticker: str,
+    daily_df: pd.DataFrame,
+    cascade_step: int | None,
+) -> dict | None:
+    """
+    Detect D20 Momentum Touch signal (3D).
+
+    PRECONDITIONS (all must hold; else return None):
+      - cascade_step is not None
+      - cascade_step == 1
+      - D20, D50, D100, D150, D200 all non-NaN on latest bar
+      - Strict stack: D20 > D50 > D100 > D150 > D200  (strict >, not >=)
+
+    TRIGGER (all must hold on today's bar):
+      - today.low  <= D20_today
+      - today.close > D20_today
+      - today.volume >= MOMENTUM_VOLUME_MULTIPLIER * volume_avg_20d
+
+    volume_avg_20d = daily_df['volume'].iloc[-21:-1].mean()
+      → 20 bars ending yesterday (excludes today). Assumes oldest-first ordering.
+
+    NOTE: MAs must be pre-computed by the caller (runner uses MA_PERIODS_DAILY).
+          This function does NOT call compute_ma internally.
+    """
+    # FIX-3: cascade guard — first line
+    if cascade_step is None:
+        return None
+
+    if cascade_step != 1:
+        return None
+
+    if daily_df.empty:
+        return None
+
+    # Need at least 21 bars (20 for volume avg + today)
+    if len(daily_df) < 21:
+        return None
+
+    # Check all required MA columns are present and non-NaN on the latest bar
+    for period in (20, 50, 100, 150, 200):
+        col = f"ma_{period}"
+        if col not in daily_df.columns:
+            logger.debug("3D: ma_%d column missing for %s — MAs not pre-computed", period, ticker)
+            return None
+        if not _is_valid(daily_df[col].iloc[-1]):
+            logger.debug("3D: ma_%d is NaN for %s", period, ticker)
+            return None
+
+    d20  = float(daily_df["ma_20"].iloc[-1])
+    d50  = float(daily_df["ma_50"].iloc[-1])
+    d100 = float(daily_df["ma_100"].iloc[-1])
+    d150 = float(daily_df["ma_150"].iloc[-1])
+    d200 = float(daily_df["ma_200"].iloc[-1])
+
+    # Strict stack check: D20 > D50 > D100 > D150 > D200
+    if not (d20 > d50 > d100 > d150 > d200):
+        logger.debug(
+            "3D: MA stack not met for %s — D20=%.2f D50=%.2f D100=%.2f D150=%.2f D200=%.2f",
+            ticker, d20, d50, d100, d150, d200,
+        )
+        return None
+
+    today_bar   = daily_df.iloc[-1]
+    today_low   = float(today_bar["low"])
+    today_close = float(today_bar["close"])
+    today_vol   = float(today_bar["volume"])
+
+    # Volume average: canonical 20-bar slice ending yesterday
+    volume_avg_20d = float(daily_df["volume"].iloc[-21:-1].mean())
+
+    # Trigger conditions
+    wick_touched = today_low <= d20
+    closed_above = today_close > d20
+    volume_ok    = today_vol >= MOMENTUM_VOLUME_MULTIPLIER * volume_avg_20d
+
+    if not (wick_touched and closed_above and volume_ok):
+        logger.debug(
+            "3D not triggered for %s: wick=%s close=%s vol=%s (%.2f× avg)",
+            ticker, wick_touched, closed_above, volume_ok,
+            today_vol / volume_avg_20d if volume_avg_20d > 0 else 0.0,
+        )
+        return None
+
+    volume_ratio = round(today_vol / volume_avg_20d, 2)
+
+    alert = build_alert(
+        ticker=ticker,
+        signal_type="3D",
+        timeframe="D",
+        ma_period=20,
+        price=today_close,
+        ma_value=d20,
+        extra={"low": today_low, "close": today_close},
+        volume_ratio=volume_ratio,
+    )
+    logger.info(
+        "3D fired for %s @ %.4f — vol %.2f× avg, D20=%.2f>D50=%.2f>D100=%.2f>D150=%.2f>D200=%.2f",
+        ticker, today_close, volume_ratio, d20, d50, d100, d150, d200,
+    )
+    return alert
 

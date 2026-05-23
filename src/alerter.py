@@ -164,6 +164,35 @@ def _format_3c(alert: dict) -> str:
     )
 
 
+def _format_3d(alert: dict) -> str:
+    """Format a 3D D20 Momentum Touch alert as MarkdownV2."""
+    ticker = _escape_md2(alert["ticker"])
+    price  = _fmt_price(alert.get("price"))
+    d20    = _fmt_price(alert.get("ma_value"))
+
+    extra      = alert.get("extra", {})
+    wick_low   = _fmt_price(extra.get("low"))
+    close_val  = _fmt_price(extra.get("close"))
+
+    vol_ratio  = alert.get("volume_ratio") or 0.0
+    vol_str    = _escape_md2(f"{vol_ratio:.1f}× avg")
+
+    stack_str  = _escape_md2("D20 > D50 > D100 > D150 > D200 ✓")
+
+    return (
+        f"🚀 {ticker} — {_escape_md2('D20 Momentum Touch')}\n"
+        f"\n"
+        f"Price:        {price}\n"
+        f"D20 MA:       {d20}\n"
+        f"Volume:       {vol_str}\n"
+        f"MA stack:     {stack_str}\n"
+        f"\n"
+        f"Wick low touched {wick_low}, closed at {close_val}\n"
+        f"\n"
+        f"⚠️ {_escape_md2('Continuation entry — check chart for trend integrity.')}"
+    )
+
+
 def _format_halt_warning(ticker: str, last_success: str | None) -> str:
     """Format a halt/data-failure warning message as MarkdownV2."""
     t = _escape_md2(ticker)
@@ -189,6 +218,8 @@ def format_alert(alert: dict) -> str:
         return _format_3b(alert)
     if signal_type == "TOUCH_ACCUMULATION":
         return _format_3c(alert)
+    if signal_type == "3D":
+        return _format_3d(alert)
     if signal_type == "HALT_WARNING":
         extra = alert.get("extra", {})
         return _format_halt_warning(alert["ticker"], extra.get("last_success"))

@@ -348,3 +348,156 @@ class TestSignalOrdering:
 
         alerts_3c = detect_3c_touch_accumulation("TEST", df, _empty_df(), _empty_df(), cascade_step=1)
         assert any(a["signal_type"] == "TOUCH_ACCUMULATION" for a in alerts_3c)
+
+
+# ---------------------------------------------------------------------------
+# Signal 3D -- D20 Momentum Touch
+# ---------------------------------------------------------------------------
+
+def _make_3d_uptrend(n: int = 250, trend: float = 0.5, hist_volume: int = 1_000_000):
+    """
+    Create an oldest-first daily DataFrame with monotonically increasing prices.
+    With trend > 0: D20 > D50 > D100 > D150 > D200 naturally (shorter MA > longer MA).
+    MAs are NOT pre-computed; caller must call _add_mas() before passing to detect_3d.
+    """
+    dates = pd.bdate_range(end="2026-05-22", periods=n)
+    closes = [100.0 + i * trend for i in range(n)]
+    return pd.DataFrame(
+        {
+            "open":   [c - 0.5 for c in closes],
+            "high":   [c + 1.0 for c in closes],
+            "low":    [c - 0.5 for c in closes],
+            "close":  closes,
+            "volume": [hist_volume] * n,
+        },
+        index=dates,
+    )
+
+
+def _setup_valid_trigger(df: pd.DataFrame, today_volume: int = 2_000_000) -> float:
+    """
+    Set today's bar (iloc[-1]) so all 3D trigger conditions are met:
+      low <= D20, close > D20, volume >= 1.5× avg.
+    Returns D20 value so callers can inspect it.
+    Assumes df already has ma_20 computed.
+    """
+    d20 = float(df["ma_20"].iloc[-1])
+    df.iloc[-1, df.columns.get_loc("low")]    = d20 - 0.10   # wick touches D20
+    df.iloc[-1, df.columns.get_loc("close")]  = d20 + 0.50   # closed above
+    df.iloc[-1, df.columns.get_loc("volume")] = today_volume  # 2× avg (1M hist)
+    return d20
+
+
+class TestDetect3D:
+
+    def _run(self, df, cascade_step):
+        from src.signals import detect_3d
+        return detect_3d("TEST", df, cascade_step)
+
+    # ------------------------------------------------------------------
+    # 1. Happy path
+    # ------------------------------------------------------------------
+    def test_3d_fires_on_valid_touch(self):
+        df = _make_3d_uptrend(n=250)
+        _add_mas(df, (20, 50, 100, 150, 200))
+        _setup_valid_trigger(df, today_volume=2_000_000)
+        result = self._run(df, cascade_step=1)
+        assert result is not None
+        assert result["signal_type"] == "3D"
+        assert result["timeframe"] == "D"
+        assert result["ma_period"] == 20
+        assert result["volume_ratio"] >= 1.5
+
+    # ------------------------------------------------------------------
+    # 2. cascade_step is None → immediate None (FIX-3)
+    # ------------------------------------------------------------------
+    def test_3d_no_fire_when_cascade_step_none(self):
+        df = _make_3d_uptrend(n=250)
+        _add_mas(df, (20, 50, 100, 150, 200))
+        _setup_valid_trigger(df)
+        assert self._run(df, cascade_step=None) is None
+
+    # ------------------------------------------------------------------
+    # 3. cascade_step != 1 → None
+    # ------------------------------------------------------------------
+    def test_3d_no_fire_when_not_step_1(self):
+        df = _make_3d_uptrend(n=250)
+        _add_mas(df, (20, 50, 100, 150, 200))
+        _setup_valid_trigger(df)
+        assert self._run(df, cascade_step=2) is None
+
+    # ------------------------------------------------------------------
+    # 4. Unstacked (D50 > D20) → None
+    # ------------------------------------------------------------------
+    def test_3d_no_fire_when_unstacked(self):
+        df = _make_3d_uptrend(n=250)
+        _add_mas(df, (20, 50, 100, 150, 200))
+        d20 = _setup_valid_trigger(df)
+        # Force D50 above D20 — stack broken
+        df["ma_50"] = d20 + 5.0
+        assert self._run(df, cascade_step=1) is None
+
+    # ------------------------------------------------------------------
+    # 5. Strict stack: D20 == D50 → None (>= would fire, > must not)
+    # ------------------------------------------------------------------
+    def test_3d_strict_stack_equal_mas_fail(self):
+        # Flat prices → all MAs equal after compute
+        df = _make_daily_df(n=250, base_close=150.0, trend=0.0, volume=1_000_000)
+        _add_mas(df, (20, 50, 100, 150, 200))
+        d20 = float(df["ma_20"].iloc[-1])
+        # Set valid trigger (stack check will fail because D20 == D50 == ...)
+        df.iloc[-1, df.columns.get_loc("low")]    = d20 - 0.10
+        df.iloc[-1, df.columns.get_loc("close")]  = d20 + 0.50
+        df.iloc[-1, df.columns.get_loc("volume")] = 2_000_000
+        assert self._run(df, cascade_step=1) is None
+
+    # ------------------------------------------------------------------
+    # 6. D200 is NaN → None
+    # ------------------------------------------------------------------
+    def test_3d_no_fire_when_d200_nan(self):
+        # n=180 < 200 → D200 is NaN at last bar
+        df = _make_3d_uptrend(n=180)
+        _add_mas(df, (20, 50, 100, 150, 200))
+        assert float.__gt__(float("nan"), 0) is False or True  # just ensure we're here
+        import math
+        assert math.isnan(float(df["ma_200"].iloc[-1]))
+        _setup_valid_trigger(df)
+        assert self._run(df, cascade_step=1) is None
+
+    # ------------------------------------------------------------------
+    # 7. No touch (low > D20) → None
+    # ------------------------------------------------------------------
+    def test_3d_no_fire_when_no_touch(self):
+        df = _make_3d_uptrend(n=250)
+        _add_mas(df, (20, 50, 100, 150, 200))
+        d20 = float(df["ma_20"].iloc[-1])
+        # Low is above D20 — no wick touch
+        df.iloc[-1, df.columns.get_loc("low")]    = d20 + 1.0
+        df.iloc[-1, df.columns.get_loc("close")]  = d20 + 3.0
+        df.iloc[-1, df.columns.get_loc("volume")] = 2_000_000
+        assert self._run(df, cascade_step=1) is None
+
+    # ------------------------------------------------------------------
+    # 8. Touched but closed below D20 → None
+    # ------------------------------------------------------------------
+    def test_3d_no_fire_when_close_below_d20(self):
+        df = _make_3d_uptrend(n=250)
+        _add_mas(df, (20, 50, 100, 150, 200))
+        d20 = float(df["ma_20"].iloc[-1])
+        df.iloc[-1, df.columns.get_loc("low")]    = d20 - 0.50   # wick touched
+        df.iloc[-1, df.columns.get_loc("close")]  = d20 - 0.10   # closed below
+        df.iloc[-1, df.columns.get_loc("volume")] = 2_000_000
+        assert self._run(df, cascade_step=1) is None
+
+    # ------------------------------------------------------------------
+    # 9. Volume below 1.5× threshold → None  (1.4× should NOT fire)
+    # ------------------------------------------------------------------
+    def test_3d_no_fire_when_low_volume(self):
+        # hist_volume=1M → avg=1M → threshold=1.5M; today=1.4M < 1.5M
+        df = _make_3d_uptrend(n=250, hist_volume=1_000_000)
+        _add_mas(df, (20, 50, 100, 150, 200))
+        d20 = float(df["ma_20"].iloc[-1])
+        df.iloc[-1, df.columns.get_loc("low")]    = d20 - 0.10
+        df.iloc[-1, df.columns.get_loc("close")]  = d20 + 0.50
+        df.iloc[-1, df.columns.get_loc("volume")] = 1_400_000   # 1.4× avg — below threshold
+        assert self._run(df, cascade_step=1) is None
