@@ -5,6 +5,8 @@ env/
 
 # Secrets
 .env
+.env.local
+.streamlit/secrets.toml
 
 # Python
 __pycache__/
@@ -34,4 +36,9 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+.vs/
 *.swp
+
+# Test artifacts
+pytest-cache-files-*/
+smoke_test_report.json

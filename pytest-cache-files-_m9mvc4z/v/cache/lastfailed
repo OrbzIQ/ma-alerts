@@ -1,4 +1,0 @@
-{
-  "tests/test_signals.py::TestDetect3BReclaim::test_streak_increments_on_close_above": true,
-  "tests/test_signals.py::TestSignalOrdering::test_3a_touch_feeds_3c": true
-}
