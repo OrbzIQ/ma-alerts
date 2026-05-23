@@ -1,13 +1,13 @@
 """
-fetcher.py — Twelve Data Daily OHLCV client.
+fetcher.py -- Twelve Data Daily OHLCV client.
 
 Symbol conventions:
   - US tickers: passed as-is (e.g. 'GOOG', 'AAPL')
-  - SG tickers: append ':SES' suffix (e.g. 'D05' → 'D05:SES')
+  - SG tickers: append ':SES' suffix (e.g. 'D05' -> 'D05:SES')
 
 Rate limiting:
-  - Free tier: 8 calls/minute. Hard minimum 8s between calls → max 7.5 calls/min.
-  - Daily ceiling: 800 calls/day. 60 tickers × 1 call = 60 calls, well within budget.
+  - Free tier: 8 calls/minute. Hard minimum 8s between calls -> max 7.5 calls/min.
+  - Daily ceiling: 800 calls/day. 60 tickers x 1 call = 60 calls, well within budget.
   - 429 responses are retried up to MAX_RETRIES_ON_429 times with RETRY_WAIT_SECONDS delay.
 """
 
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 _TWELVE_DATA_BASE = "https://api.twelvedata.com"
 
 # Twelve Data free tier: 8 calls/minute.
-# Hard minimum 8 seconds between any API call → max 7.5 calls/min.
+# Hard minimum 8 seconds between any API call -> max 7.5 calls/min.
 # Bulletproof: no sliding window math, no race conditions.
 _MIN_API_INTERVAL_SECONDS = 8.0
 _api_lock = threading.Lock()
@@ -64,7 +64,7 @@ def _api_key() -> str:
 def _map_symbol(ticker: str, market: str) -> str:
     """Apply Twelve Data symbol convention for each market."""
     if market == "SG":
-        return f"{ticker}:SES"
+        return ticker + ":SES"
     return ticker
 
 
@@ -108,7 +108,7 @@ def fetch_daily_ohlcv(
         "apikey": _api_key(),
     }
 
-    url = f"{_TWELVE_DATA_BASE}/time_series"
+    url = _TWELVE_DATA_BASE + "/time_series"
     response = None
 
     for attempt in range(MAX_RETRIES_ON_429):
@@ -169,11 +169,54 @@ def fetch_daily_ohlcv(
     for raw in raw_candles:
         if not _validate_candle(raw):
             logger.error(
-                "Malformed candle for %s (%s): %s — aborting fetch", ticker, symbol, raw
+                "Malformed candle for %s (%s): %s - aborting fetch", ticker, symbol, raw
             )
             raise ValueError(
-                f"Twelve Data returned malformed candle for {ticker}: {raw}"
+                "Twelve Data returned malformed candle for %s: %s" % (ticker, raw)
             )
         candles.append(
             {
-                "date": raw["datetime"][:10],   # 'YYYY-MM-DD HH:MM:SS' → 'YYYY-MM-
+                "date": raw["datetime"][:10],   # 'YYYY-MM-DD HH:MM:SS' -> 'YYYY-MM-DD'
+                "open": float(raw["open"]),
+                "high": float(raw["high"]),
+                "low": float(raw["low"]),
+                "close": float(raw["close"]),
+                "volume": int(float(raw["volume"])),
+            }
+        )
+
+    # Twelve Data returns newest first; reverse to oldest-first
+    candles.sort(key=lambda c: c["date"])
+
+    logger.debug("Fetched %d candles for %s (%s)", len(candles), ticker, symbol)
+    return candles
+
+
+def fetch_daily_ohlcv_bulk(
+    tickers: list[tuple[str, str]],
+    outputsize: int = 30,
+) -> dict[str, list[dict] | None]:
+    """
+    Batch wrapper. Returns dict mapping ticker -> candle list (or None on failure).
+
+    Rate pacing is handled automatically by _enforce_min_interval() inside each call.
+    No additional sleeps here.
+
+    Args:
+        tickers:    List of (ticker, market) tuples.
+        outputsize: Passed to each individual fetch call.
+    """
+    results: dict[str, list[dict] | None] = {}
+
+    for ticker, market in tickers:
+        try:
+            results[ticker] = fetch_daily_ohlcv(ticker, market, outputsize=outputsize)
+        except ValueError as exc:
+            # Malformed data -- log and treat as failure rather than propagating
+            logger.error("Malformed data for %s: %s", ticker, exc)
+            results[ticker] = None
+        except Exception as exc:
+            logger.error("Unexpected error fetching %s: %s", ticker, exc)
+            results[ticker] = None
+
+    return results
