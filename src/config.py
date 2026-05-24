@@ -20,7 +20,9 @@ MA_PERIODS_DAILY: list[int] = [20, 50, 100, 150, 200]   # Daily — 20 added for
 VOLUME_MULTIPLIER: float = 1.5          # kept for backwards compat
 MOMENTUM_VOLUME_MULTIPLIER: float = 1.5 # used by 3A (refactored) and 3D
 VOLUME_LOOKBACK_DAYS: int = 20          # Always daily, regardless of signal timeframe
-RECLAIM_STREAK_DAYS: int = 7            # 3B: consecutive closes above broken MA
+RECLAIM_STREAK_DAYS: int = 7            # 3B-D: consecutive daily closes above broken D MA
+RECLAIM_STREAK_DAYS_WEEKLY: int = 2    # 3B-W: consecutive completed weekly closes above broken W MA
+RECLAIM_STREAK_DAYS_MONTHLY: int = 2   # 3B-M: consecutive completed monthly closes above broken M MA
 TOUCH_THRESHOLD: int = 3               # 3C: qualifying touches required
 TOUCH_WINDOW_DAYS: int = 21            # 3C: rolling window in CALENDAR days (~15 trading days)
 

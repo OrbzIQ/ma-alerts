@@ -61,11 +61,13 @@ CREATE TABLE IF NOT EXISTS cascade_state (
 
 CREATE TABLE IF NOT EXISTS reclaim_tracker (
     ticker              TEXT NOT NULL,
+    timeframe           TEXT NOT NULL DEFAULT 'D' CHECK (timeframe IN ('D', 'W', 'M')),
     ma_period           INTEGER NOT NULL,
     consecutive_closes  INTEGER NOT NULL DEFAULT 0,
     streak_start        DATE,
+    last_bar_date       TEXT,                        -- most recently counted bar date (idempotency)
     last_updated        DATE NOT NULL,
-    PRIMARY KEY (ticker, ma_period),
+    PRIMARY KEY (ticker, timeframe, ma_period),
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
 );
 
@@ -441,6 +443,56 @@ def _migrate_alert_log_v3() -> None:
         logger.error("V3 migration failed: %s", exc)
 
 
+def _migrate_reclaim_tracker_v2() -> None:
+    """
+    V2 migration: add timeframe + last_bar_date columns to reclaim_tracker,
+    and extend the primary key to (ticker, timeframe, ma_period).
+
+    SQLite cannot ALTER TABLE to change a PK, so we recreate the table.
+    Existing Daily streaks are preserved with timeframe = 'D'.
+    Idempotent: checks sqlite_master for the timeframe column first.
+    """
+    try:
+        rows = _db().execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='reclaim_tracker'"
+        )
+    except Exception as exc:
+        logger.warning("reclaim_tracker V2 migration: sqlite_master read failed (%s) — skipping", exc)
+        return
+
+    if not rows:
+        return  # table doesn't exist yet; fresh _SCHEMA_SQL DDL will create it correctly
+
+    table_sql: str = (rows[0].get("sql") or "")
+    if "timeframe" in table_sql:
+        return  # already migrated
+
+    try:
+        _db().execute_script("""
+            CREATE TABLE reclaim_tracker_v2 (
+                ticker              TEXT NOT NULL,
+                timeframe           TEXT NOT NULL DEFAULT 'D',
+                ma_period           INTEGER NOT NULL,
+                consecutive_closes  INTEGER NOT NULL DEFAULT 0,
+                streak_start        DATE,
+                last_bar_date       TEXT,
+                last_updated        DATE NOT NULL,
+                PRIMARY KEY (ticker, timeframe, ma_period)
+            );
+            INSERT INTO reclaim_tracker_v2
+                (ticker, timeframe, ma_period, consecutive_closes,
+                 streak_start, last_bar_date, last_updated)
+            SELECT ticker, 'D', ma_period, consecutive_closes,
+                   streak_start, NULL, last_updated
+            FROM reclaim_tracker;
+            DROP TABLE reclaim_tracker;
+            ALTER TABLE reclaim_tracker_v2 RENAME TO reclaim_tracker
+        """)
+        logger.info("reclaim_tracker V2 migration complete — timeframe + last_bar_date added")
+    except Exception as exc:
+        logger.error("reclaim_tracker V2 migration failed: %s", exc)
+
+
 def init_schema() -> None:
     """
     Run DDL to create all tables and indexes. Idempotent — safe to call on every run.
@@ -448,6 +500,7 @@ def init_schema() -> None:
     _db().execute_script(_SCHEMA_SQL)
     _migrate_alert_log_v2()
     _migrate_alert_log_v3()
+    _migrate_reclaim_tracker_v2()
     logger.info("Schema initialised (or already up to date)")
 
 
@@ -543,44 +596,54 @@ def set_cascade_state(ticker: str, step: int, broken_ma: str) -> None:
 # Reclaim tracker
 # ---------------------------------------------------------------------------
 
-def get_reclaim_streak(ticker: str, ma_period: int) -> int:
-    """Returns current consecutive-closes-above count."""
+def get_reclaim_streak(ticker: str, timeframe: str, ma_period: int) -> int:
+    """Returns current consecutive-closes-above count for (ticker, timeframe, ma_period)."""
     rows = _db().execute(
-        "SELECT consecutive_closes FROM reclaim_tracker WHERE ticker = ? AND ma_period = ?",
-        [ticker, ma_period],
+        "SELECT consecutive_closes FROM reclaim_tracker "
+        "WHERE ticker = ? AND timeframe = ? AND ma_period = ?",
+        [ticker, timeframe, ma_period],
     )
     return rows[0]["consecutive_closes"] if rows else 0
 
 
-def get_reclaim_streak_full(ticker: str, ma_period: int) -> dict:
+def get_reclaim_streak_full(ticker: str, timeframe: str, ma_period: int) -> dict:
     """Returns full reclaim tracker row as dict, or defaults if not found."""
     rows = _db().execute(
-        "SELECT consecutive_closes, streak_start, last_updated "
-        "FROM reclaim_tracker WHERE ticker = ? AND ma_period = ?",
-        [ticker, ma_period],
+        "SELECT consecutive_closes, streak_start, last_bar_date, last_updated "
+        "FROM reclaim_tracker WHERE ticker = ? AND timeframe = ? AND ma_period = ?",
+        [ticker, timeframe, ma_period],
     )
     if rows:
         return dict(rows[0])
-    return {"consecutive_closes": 0, "streak_start": None, "last_updated": None}
+    return {
+        "consecutive_closes": 0,
+        "streak_start": None,
+        "last_bar_date": None,
+        "last_updated": None,
+    }
 
 
 def set_reclaim_streak(
     ticker: str,
+    timeframe: str,
     ma_period: int,
     streak: int,
     streak_start: date | None = None,
+    last_bar_date: date | None = None,
 ) -> None:
     """
-    Upsert reclaim streak for this ticker + MA period.
+    Upsert reclaim streak for this (ticker, timeframe, ma_period).
     streak_start: the date the streak began; pass None when resetting streak to 0.
+    last_bar_date: the bar date last counted toward the streak (prevents double-counting).
     """
     today = date.today().isoformat()
     start_str = streak_start.isoformat() if streak_start else None
+    bar_str = last_bar_date.isoformat() if last_bar_date else None
     _db().execute(
         "INSERT OR REPLACE INTO reclaim_tracker "
-        "(ticker, ma_period, consecutive_closes, streak_start, last_updated) "
-        "VALUES (?, ?, ?, ?, ?)",
-        [ticker, ma_period, streak, start_str, today],
+        "(ticker, timeframe, ma_period, consecutive_closes, streak_start, last_bar_date, last_updated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [ticker, timeframe, ma_period, streak, start_str, bar_str, today],
     )
 
 

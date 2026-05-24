@@ -32,11 +32,13 @@ CREATE TABLE IF NOT EXISTS cascade_state (
 
 CREATE TABLE IF NOT EXISTS reclaim_tracker (
     ticker              TEXT NOT NULL,
+    timeframe           TEXT NOT NULL DEFAULT 'D' CHECK (timeframe IN ('D', 'W', 'M')),
     ma_period           INTEGER NOT NULL,            -- e.g. 50, 100, 150, 200
     consecutive_closes  INTEGER NOT NULL DEFAULT 0,
     streak_start        DATE,                        -- nullable; null when streak == 0
+    last_bar_date       TEXT,                        -- last bar date counted (prevents W/M double-count)
     last_updated        DATE NOT NULL,
-    PRIMARY KEY (ticker, ma_period),
+    PRIMARY KEY (ticker, timeframe, ma_period),
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
 );
 
