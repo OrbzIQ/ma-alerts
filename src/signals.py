@@ -30,6 +30,7 @@ from src.config import (
     TOUCH_WINDOW_DAYS,
     VOLUME_LOOKBACK_DAYS,
 )
+from src.labels import label_for
 from src.ma import latest_ma_value
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,24 @@ def _get_proximity_winner(
         if current_price > ma_val:
             return period
     return None
+
+
+def _latest_completed_bar(df: pd.DataFrame, today: date) -> pd.Series | None:
+    """Return the most recent bar whose index date is strictly before today.
+
+    Prevents in-progress weekly/monthly bars from being evaluated as if they
+    were closed. A weekly bar whose Friday index date equals today is excluded
+    because the market is still open (or just closed — the cascade rule is
+    conservative: strictly before today).
+
+    Returns None if df is empty or all bars are dated today-or-later.
+    """
+    if df.empty:
+        return None
+    completed = df[df.index.date < today]
+    if completed.empty:
+        return None
+    return completed.iloc[-1]
 
 
 def _next_resistance(
@@ -215,30 +234,39 @@ def detect_3a_ma_support(
         if df.empty:
             continue
 
-        winner_period = _get_proximity_winner(tf, periods, df, today_close)
+        # For W/M, restrict to completed (closed) bars only.
+        # An in-progress week/month must not be evaluated as a confirmed signal.
+        if tf != "D":
+            eval_df = df[df.index.date < today_date]
+            if eval_df.empty:
+                logger.debug("3A: no completed %s bars for %s", tf, ticker)
+                continue
+        else:
+            eval_df = df
+
+        winner_period = _get_proximity_winner(tf, periods, eval_df, today_close)
         if winner_period is None:
             continue
 
-        ma_val_raw = df[f"ma_{winner_period}"].iloc[-1]
+        ma_val_raw = eval_df[f"ma_{winner_period}"].iloc[-1]
         if not _is_valid(ma_val_raw):
             continue
         ma_val = float(ma_val_raw)
 
-        # For weekly/monthly, get the bar that corresponds to the current period
-        # The "today's bar" for signal evaluation:
+        # Bar to evaluate for wick/close conditions:
+        # D  → today's daily bar.
+        # W/M → last completed bar (strictly before today).
         if tf == "D":
             bar_low = today_low
             bar_close = today_close
-        elif tf == "W":
-            if weekly_df.empty:
+            touch_date = today_date
+        else:  # W or M
+            bar = _latest_completed_bar(df, today_date)
+            if bar is None:
                 continue
-            bar_low = float(weekly_df.iloc[-1]["low"])
-            bar_close = float(weekly_df.iloc[-1]["close"])
-        else:  # M
-            if monthly_df.empty:
-                continue
-            bar_low = float(monthly_df.iloc[-1]["low"])
-            bar_close = float(monthly_df.iloc[-1]["close"])
+            bar_low = float(bar["low"])
+            bar_close = float(bar["close"])
+            touch_date = bar.name.date()
 
         # Wick condition: bar low ≤ MA value
         wick_touched = bar_low <= ma_val
@@ -259,8 +287,8 @@ def detect_3a_ma_support(
             )
             continue
 
-        # All conditions met — record touch and emit alert
-        db.record_touch(ticker, tf, winner_period, today_date)
+        # All conditions met — record touch (using bar's own date for W/M) and emit alert
+        db.record_touch(ticker, tf, winner_period, touch_date)
 
         touch_count = len(db.get_recent_touches(ticker, tf, winner_period, TOUCH_WINDOW_DAYS))
 
@@ -286,7 +314,7 @@ def detect_3a_ma_support(
             volume_ratio=vol_ratio,
         )
         alerts.append(alert)
-        logger.info("3A fired for %s %s%d @ %.4f", ticker, tf, winner_period, today_close)
+        logger.info("%s fired for %s %s%d @ %.4f", label_for("3a"), ticker, tf, winner_period, today_close)
 
     return alerts
 
@@ -372,7 +400,7 @@ def detect_3b_reclaim(
                 volume_ratio=None,
             )
             logger.info(
-                "3B confirmed for %s D%d — streak=%d", ticker, ma_period, new_streak
+                "%s confirmed for %s D%d — streak=%d", label_for("3b"), ticker, ma_period, new_streak
             )
             return alert
     else:
@@ -416,6 +444,7 @@ def detect_3c_touch_accumulation(
             _compute_ma(df_obj, MA_PERIODS)
 
     today_close = float(daily_df.iloc[-1]["close"])
+    today_date: date = daily_df.index[-1].date()
 
     checks = CASCADE_CHECKS.get(cascade_step, [])
 
@@ -431,11 +460,19 @@ def detect_3c_touch_accumulation(
         if df.empty:
             continue
 
-        winner_period = _get_proximity_winner(tf, periods, df, today_close)
+        # For W/M, restrict to completed bars (same rule as 3A)
+        if tf != "D":
+            eval_df = df[df.index.date < today_date]
+            if eval_df.empty:
+                continue
+        else:
+            eval_df = df
+
+        winner_period = _get_proximity_winner(tf, periods, eval_df, today_close)
         if winner_period is None:
             continue
 
-        ma_val_raw = df[f"ma_{winner_period}"].iloc[-1]
+        ma_val_raw = eval_df[f"ma_{winner_period}"].iloc[-1]
         if not _is_valid(ma_val_raw):
             continue
         ma_val = float(ma_val_raw)
@@ -460,7 +497,7 @@ def detect_3c_touch_accumulation(
             )
             alerts.append(alert)
             logger.info(
-                "3C fired for %s %s%d — %d touches in window", ticker, tf, winner_period, count
+                "%s fired for %s %s%d — %d touches in window", label_for("3c"), ticker, tf, winner_period, count
             )
 
     return alerts

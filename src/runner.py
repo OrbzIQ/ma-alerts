@@ -37,7 +37,6 @@ import os
 import sys
 from datetime import date
 
-import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -85,33 +84,22 @@ def _check_env() -> None:
 
 def _load_watchlist_from_yaml(market: str) -> list[dict]:
     """
-    Parse watchlist.yml and sync new tickers to DB.
-    Returns list of active tickers for the given market.
+    Sync watchlist.yaml → DB and return active tickers for the given market.
+    YAML parsing is delegated to src.config.load_watchlist().
     """
     import src.db as db
     from src.bootstrap import bootstrap_ticker
+    from src.config import load_watchlist
 
-    watchlist_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "watchlist.yml")
-    if not os.path.exists(watchlist_path):
-        logger.warning("watchlist.yml not found at %s — no tickers to scan", watchlist_path)
-        return []
+    tickers = load_watchlist()  # flat list of US ticker strings
 
-    with open(watchlist_path, "r") as f:
-        data = yaml.safe_load(f) or {}
-
-    yaml_tickers = data.get("tickers") or []
-
-    for entry in yaml_tickers:
-        t = entry.get("ticker", "").upper()
-        m = entry.get("market", "US").upper()
-        if not t:
-            continue
-        is_new = db.add_watchlist_ticker(t, m)
+    for ticker in tickers:
+        is_new = db.add_watchlist_ticker(ticker, "US")
         if is_new:
-            logger.info("New ticker %s detected in watchlist — bootstrapping", t)
-            success = bootstrap_ticker(t, m)
+            logger.info("New ticker %s detected in watchlist — bootstrapping", ticker)
+            success = bootstrap_ticker(ticker, "US")
             if not success:
-                logger.error("Bootstrap failed for %s — skipping this ticker", t)
+                logger.error("Bootstrap failed for %s — skipping this ticker", ticker)
 
     return db.get_watchlist(market)
 
