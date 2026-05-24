@@ -35,7 +35,7 @@ import argparse
 import logging
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 from dotenv import load_dotenv
 
@@ -150,6 +150,22 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
         daily_df = db.get_all_ohlcv(ticker)
         if daily_df.empty:
             logger.warning("No OHLCV in DB for %s after upsert", ticker)
+            return []
+
+        # 4e-bis. OHLCV freshness gate (L6).
+        # Count business days (Mon–Fri) between the last stored bar and today.
+        # > 2 means the data is too stale to trust for signal detection — skip.
+        import pandas as pd
+        _last_bar = daily_df.index[-1].date()
+        _stale_days = len(pd.bdate_range(
+            start=_last_bar + timedelta(days=1),
+            end=date.today(),
+        ))
+        if _stale_days > 2:
+            logger.warning(
+                "Skipping %s — OHLCV stale by %d trading days (last bar: %s)",
+                ticker, _stale_days, _last_bar,
+            )
             return []
 
         compute_ma(daily_df, MA_PERIODS_DAILY)  # includes D20 for 3D signal
