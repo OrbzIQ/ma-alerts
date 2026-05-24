@@ -245,26 +245,36 @@ def format_alert(alert: dict) -> str:
 # Telegram dispatch
 # ---------------------------------------------------------------------------
 
-def send_telegram_message(message: str) -> bool:
+def send_telegram_message(
+    message: str,
+    *,
+    chat_id: str | None = None,
+    parse_mode: str | None = "MarkdownV2",
+) -> bool:
     """
-    Send a MarkdownV2 message to TELEGRAM_CHAT_ID via TELEGRAM_BOT_TOKEN.
+    Send a message to Telegram via TELEGRAM_BOT_TOKEN.
+
+    chat_id:    target chat; defaults to TELEGRAM_CHAT_ID env var.
+    parse_mode: Telegram parse mode; defaults to MarkdownV2.
+                Pass None for plain text (e.g. ops alerts).
     Returns True on success, False on any failure.
     """
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    resolved_chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
 
-    if not token or not chat_id:
+    if not token or not resolved_chat_id:
         logger.error(
-            "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — cannot send message"
+            "TELEGRAM_BOT_TOKEN or chat_id not set — cannot send message"
         )
         return False
 
     url = f"{_TELEGRAM_API_BASE}/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
+    payload: dict = {
+        "chat_id": resolved_chat_id,
         "text": message,
-        "parse_mode": "MarkdownV2",
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
 
     try:
         response = requests.post(url, json=payload, timeout=15)
@@ -284,6 +294,26 @@ def send_telegram_message(message: str) -> bool:
         return False
 
     return True
+
+
+def send_ops_message(text: str) -> bool:
+    """
+    Send a plain-text [OPS] alert to the dedicated ops Telegram chat.
+
+    Targets TELEGRAM_OPS_CHAT_ID. If unset, logs a warning and falls back to
+    the signal chat (TELEGRAM_CHAT_ID) so no ops alert is silently lost.
+    Always prefixes the message with '[OPS]' for visual scanability.
+    """
+    ops_chat_id = os.getenv("TELEGRAM_OPS_CHAT_ID", "")
+    message = f"[OPS] {text}"
+
+    if not ops_chat_id:
+        logger.warning(
+            "TELEGRAM_OPS_CHAT_ID not set — routing ops alert to signal chat"
+        )
+        return send_telegram_message(message, parse_mode=None)
+
+    return send_telegram_message(message, chat_id=ops_chat_id, parse_mode=None)
 
 
 def dispatch_alerts(alerts: list[dict]) -> int:

@@ -38,6 +38,41 @@ _last_api_call_time: float = 0.0
 MAX_RETRIES_ON_429 = 3
 RETRY_WAIT_SECONDS = 65
 
+# API credit budget (Twelve Data free tier)
+_DAILY_CREDIT_QUOTA: int = 800
+_CREDIT_WARNING_THRESHOLD: int = 640  # 80 % of daily quota
+
+
+def _account_credit() -> None:
+    """
+    Record one API credit consumed for today (UTC date).
+
+    Fires a single [OPS] warning the first time daily usage crosses
+    _CREDIT_WARNING_THRESHOLD (transition: before < threshold <= after).
+    Subsequent calls that day are above the threshold already, so no
+    further warnings fire — the guard is the before/after transition check.
+
+    All failures are caught and logged — accounting must never abort a fetch.
+    """
+    try:
+        from datetime import date as _date
+        import src.db as _db_mod
+
+        today = _date.today().isoformat()
+        before = _db_mod.get_credits_used(today)
+        after = _db_mod.increment_credits(today)
+
+        if before < _CREDIT_WARNING_THRESHOLD <= after:
+            from src.alerter import send_ops_message
+            pct = round(after / _DAILY_CREDIT_QUOTA * 100)
+            send_ops_message(
+                f"API credit warning — {pct}% of daily quota used\n"
+                f"Date: {today}  Used: {after}/{_DAILY_CREDIT_QUOTA}\n"
+                f"Threshold: {_CREDIT_WARNING_THRESHOLD} credits (80%)"
+            )
+    except Exception as exc:
+        logger.warning("Credit accounting failed (non-fatal): %s", exc)
+
 
 def _enforce_min_interval() -> None:
     """Block until at least _MIN_API_INTERVAL_SECONDS has passed since the last API call.
@@ -138,6 +173,9 @@ def fetch_daily_ohlcv(
     else:
         logger.error("Rate limit retries exhausted for %s", ticker)
         return None
+
+    # A 200 response was received — account for one API credit consumed.
+    _account_credit()
 
     try:
         payload = response.json()
