@@ -112,6 +112,11 @@ CREATE TABLE IF NOT EXISTS data_health (
     last_warning_sent       DATE,
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
 );
+
+CREATE TABLE IF NOT EXISTS api_usage (
+    date            TEXT NOT NULL PRIMARY KEY,     -- 'YYYY-MM-DD' UTC
+    credits_used    INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -493,6 +498,39 @@ def _migrate_reclaim_tracker_v2() -> None:
         logger.error("reclaim_tracker V2 migration failed: %s", exc)
 
 
+def _migrate_api_usage_v1() -> None:
+    """
+    B3 migration: ensure api_usage table exists on DBs created before B3.
+
+    Fresh installs already have the table via _SCHEMA_SQL DDL.
+    For existing DBs, CREATE TABLE IF NOT EXISTS in _SCHEMA_SQL handles it too,
+    but this function makes the migration explicit and logged — matching the
+    convention used by prior migrations.
+    Idempotent — safe to run on every startup.
+    """
+    try:
+        rows = _db().execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='api_usage'"
+        )
+    except Exception as exc:
+        logger.warning("api_usage migration: sqlite_master read failed (%s) — skipping", exc)
+        return
+
+    if rows:
+        return  # table already present
+
+    try:
+        _db().execute(
+            "CREATE TABLE IF NOT EXISTS api_usage ("
+            "    date TEXT NOT NULL PRIMARY KEY,"
+            "    credits_used INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+        logger.info("api_usage migration: table created")
+    except Exception as exc:
+        logger.error("api_usage migration failed: %s", exc)
+
+
 def init_schema() -> None:
     """
     Run DDL to create all tables and indexes. Idempotent — safe to call on every run.
@@ -501,6 +539,7 @@ def init_schema() -> None:
     _migrate_alert_log_v2()
     _migrate_alert_log_v3()
     _migrate_reclaim_tracker_v2()
+    _migrate_api_usage_v1()
     logger.info("Schema initialised (or already up to date)")
 
 
@@ -909,3 +948,39 @@ def get_watchlist(market: str | None = None) -> list[dict]:
             "SELECT ticker, market, added_at FROM watchlist WHERE active = 1"
         )
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# API usage tracking (B3)
+# ---------------------------------------------------------------------------
+
+def get_credits_used(date_str: str) -> int:
+    """
+    Return credits_used for date_str ('YYYY-MM-DD' UTC).
+    Returns 0 if no row exists yet for that date.
+    """
+    rows = _db().execute(
+        "SELECT credits_used FROM api_usage WHERE date = ?",
+        [date_str],
+    )
+    return rows[0]["credits_used"] if rows else 0
+
+
+def increment_credits(date_str: str, n: int = 1) -> int:
+    """
+    Increment credits_used for date_str by n. Creates the row if it does not exist.
+    Returns the new running total for that date.
+    """
+    _db().execute(
+        "INSERT OR IGNORE INTO api_usage (date, credits_used) VALUES (?, 0)",
+        [date_str],
+    )
+    _db().execute(
+        "UPDATE api_usage SET credits_used = credits_used + ? WHERE date = ?",
+        [n, date_str],
+    )
+    rows = _db().execute(
+        "SELECT credits_used FROM api_usage WHERE date = ?",
+        [date_str],
+    )
+    return rows[0]["credits_used"] if rows else n

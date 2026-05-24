@@ -83,3 +83,8 @@ CREATE TABLE IF NOT EXISTS data_health (
     last_warning_sent       DATE,                  -- nullable
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
 );
+
+CREATE TABLE IF NOT EXISTS api_usage (
+    date            TEXT NOT NULL PRIMARY KEY,     -- 'YYYY-MM-DD' UTC
+    credits_used    INTEGER NOT NULL DEFAULT 0
+);

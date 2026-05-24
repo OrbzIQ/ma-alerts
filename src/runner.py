@@ -35,7 +35,7 @@ import argparse
 import logging
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from dotenv import load_dotenv
 
@@ -273,81 +273,115 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
 def main(market: str) -> int:
     """
     Main entry point. Returns exit code: 0 on success, 1 on hard failure.
+    On unexpected exception: sends [OPS] failure alert then re-raises.
     """
     logger.info("MA Alert runner starting — market=%s date=%s", market, date.today())
 
-    # 1. Verify env
+    # Tracked outside the try so the except block can report them.
+    _watchlist_size: int = 0
+    _tickers_processed: int = 0
+
     try:
-        _check_env()
-    except RuntimeError as exc:
-        logger.critical("%s", exc)
-        return 1
-
-    import src.db as db
-    from src.alerter import dispatch_alerts
-    from src.config import OHLCV_RETENTION_YEARS, TOUCH_WINDOW_DAYS
-    from src.health import check_and_warn_halts
-
-    # 2. Init schema
-    try:
-        db.init_schema()
-    except Exception as exc:
-        logger.critical("Schema init failed: %s", exc)
-        return 1
-
-    # 3. Load watchlist
-    try:
-        watchlist = _load_watchlist_from_yaml(market)
-    except Exception as exc:
-        logger.critical("Watchlist load failed: %s", exc)
-        return 1
-
-    if not watchlist:
-        logger.warning("Watchlist is empty for market=%s — nothing to scan", market)
-        return 0
-
-    logger.info("Scanning %d tickers for market=%s", len(watchlist), market)
-
-    # 4. Process tickers
-    all_alerts: list[dict] = []
-    scan_errors = 0
-
-    for entry in watchlist:
-        ticker = entry["ticker"]
+        # 1. Verify env
         try:
-            ticker_alerts = _process_ticker(ticker, market)
-            all_alerts.extend(ticker_alerts)
+            _check_env()
+        except RuntimeError as exc:
+            logger.critical("%s", exc)
+            return 1
+
+        import src.db as db
+        from src.alerter import dispatch_alerts, send_ops_message
+        from src.config import OHLCV_RETENTION_YEARS, TOUCH_WINDOW_DAYS
+        from src.health import check_and_warn_halts
+
+        # 2. Init schema
+        try:
+            db.init_schema()
         except Exception as exc:
-            logger.error("Unexpected exception for %s (should have been caught): %s", ticker, exc)
-            scan_errors += 1
+            logger.critical("Schema init failed: %s", exc)
+            return 1
 
-    # 5. Halt warnings
-    halt_warnings = check_and_warn_halts()
-    if halt_warnings:
-        logger.warning("Halt warnings dispatched for: %s", ", ".join(halt_warnings))
+        # 3. Load watchlist
+        try:
+            watchlist = _load_watchlist_from_yaml(market)
+        except Exception as exc:
+            logger.critical("Watchlist load failed: %s", exc)
+            return 1
 
-    # 6 + 7. Dispatch alerts (persists to alert_log on success)
-    sent = dispatch_alerts(all_alerts)
-    logger.info("Dispatched %d / %d alerts", sent, len(all_alerts))
+        if not watchlist:
+            logger.warning("Watchlist is empty for market=%s — nothing to scan", market)
+            return 0
 
-    # 8. Retention pruning
-    try:
-        db.prune_old_ohlcv(OHLCV_RETENTION_YEARS)
-        db.prune_old_touches(TOUCH_WINDOW_DAYS)
+        _watchlist_size = len(watchlist)
+        logger.info("Scanning %d tickers for market=%s", _watchlist_size, market)
+
+        # 4. Process tickers
+        all_alerts: list[dict] = []
+        scan_errors = 0
+
+        for entry in watchlist:
+            ticker = entry["ticker"]
+            try:
+                ticker_alerts = _process_ticker(ticker, market)
+                all_alerts.extend(ticker_alerts)
+                _tickers_processed += 1
+            except Exception as exc:
+                logger.error("Unexpected exception for %s (should have been caught): %s", ticker, exc)
+                scan_errors += 1
+
+        # Zero-tickers guard: warn if loop ran but every iteration raised.
+        # Distinct from the exception path — run is technically clean, do not re-raise.
+        if _tickers_processed == 0 and _watchlist_size > 0:
+            _ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            send_ops_message(
+                f"Zero tickers processed — market={market} watchlist_size={_watchlist_size}\n"
+                f"All per-ticker iterations failed. Check run logs.\n"
+                f"UTC: {_ts}"
+            )
+
+        # 5. Halt warnings
+        halt_warnings = check_and_warn_halts()
+        if halt_warnings:
+            logger.warning("Halt warnings dispatched for: %s", ", ".join(halt_warnings))
+
+        # 6 + 7. Dispatch alerts (persists to alert_log on success)
+        sent = dispatch_alerts(all_alerts)
+        logger.info("Dispatched %d / %d alerts", sent, len(all_alerts))
+
+        # 8. Retention pruning
+        try:
+            db.prune_old_ohlcv(OHLCV_RETENTION_YEARS)
+            db.prune_old_touches(TOUCH_WINDOW_DAYS)
+        except Exception as exc:
+            logger.warning("Retention pruning error (non-fatal): %s", exc)
+
+        # 9. Summary
+        logger.info(
+            "Run complete — market=%s tickers_scanned=%d alerts_fired=%d alerts_sent=%d errors=%d",
+            market,
+            _watchlist_size,
+            len(all_alerts),
+            sent,
+            scan_errors,
+        )
+
+        return 0 if scan_errors == 0 else 1
+
     except Exception as exc:
-        logger.warning("Retention pruning error (non-fatal): %s", exc)
-
-    # 9. Summary
-    logger.info(
-        "Run complete — market=%s tickers_scanned=%d alerts_fired=%d alerts_sent=%d errors=%d",
-        market,
-        len(watchlist),
-        len(all_alerts),
-        sent,
-        scan_errors,
-    )
-
-    return 0 if scan_errors == 0 else 1
+        _ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        _msg = (
+            f"Run FAILED — market={market}\n"
+            f"Tickers attempted: {_tickers_processed}/{_watchlist_size}\n"
+            f"Type: {type(exc).__name__}\n"
+            f"Detail: {repr(exc)[:200]}\n"
+            f"UTC: {_ts}"
+        )
+        try:
+            from src.alerter import send_ops_message
+            send_ops_message(_msg)
+        except Exception as alert_exc:
+            logger.error("Failed to send ops failure alert: %s", alert_exc)
+        raise
 
 
 # ---------------------------------------------------------------------------
