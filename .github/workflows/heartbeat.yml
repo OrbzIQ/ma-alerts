@@ -1,0 +1,32 @@
+name: Heartbeat
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'   # Every Sunday 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Empty commit
+        run: git commit --allow-empty -m "chore: heartbeat"
+
+      - name: Push to main
+        run: git push origin main

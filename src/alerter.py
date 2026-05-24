@@ -279,10 +279,31 @@ def dispatch_alerts(alerts: list[dict]) -> int:
     Inserts successfully-sent alerts into alert_log.
     Failed sends are logged but do not abort the run.
 
+    Cooldown gate: skips any alert whose (ticker, signal_type, timeframe,
+    ma_period) combo already has a row in alert_log within the last
+    ALERT_COOLDOWN_DAYS days (default 5, overridable via env var).
+
     Returns the count of successfully sent messages.
     """
+    cooldown_days = int(os.getenv("ALERT_COOLDOWN_DAYS", "5"))
     sent = 0
     for alert in alerts:
+        ticker = alert.get("ticker", "")
+        signal_type = alert.get("signal_type", "")
+        timeframe = alert.get("timeframe")
+        ma_period = alert.get("ma_period")
+
+        if db.recent_alert_exists(ticker, ma_period, timeframe, signal_type, days=cooldown_days):
+            logger.info(
+                "Suppressed by cooldown (%dd): %s %s %s%s",
+                cooldown_days,
+                ticker,
+                signal_type,
+                timeframe or "",
+                ma_period or "",
+            )
+            continue
+
         try:
             message = format_alert(alert)
         except Exception as exc:

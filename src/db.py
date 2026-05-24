@@ -92,12 +92,16 @@ CREATE TABLE IF NOT EXISTS alert_log (
     ma_value        REAL,
     volume_ratio    REAL,
     extra_json      TEXT,
+    bar_date        TEXT,                         -- ISO date of the bar that triggered the signal
     fired_at        TEXT NOT NULL,
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
 );
 
 CREATE INDEX IF NOT EXISTS idx_alert_log_ticker_time
   ON alert_log(ticker, fired_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_alert_log_dedup
+  ON alert_log(ticker, ma_period, timeframe, signal_type);
 
 CREATE TABLE IF NOT EXISTS data_health (
     ticker                  TEXT NOT NULL PRIMARY KEY,
@@ -398,11 +402,43 @@ def _migrate_alert_log_v2() -> None:
             DROP TABLE alert_log;
             ALTER TABLE alert_log_v2 RENAME TO alert_log;
             CREATE INDEX IF NOT EXISTS idx_alert_log_ticker_time
-              ON alert_log(ticker, fired_at DESC)
+              ON alert_log(ticker, fired_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_alert_log_dedup
+              ON alert_log(ticker, ma_period, timeframe, signal_type)
         """)
         logger.info("V2 migration complete — alert_log signal_type CHECK constraint removed")
     except Exception as exc:
         logger.error("V2 migration failed: %s", exc)
+
+
+def _migrate_alert_log_v3() -> None:
+    """
+    V3 migration: add bar_date TEXT column to alert_log.
+
+    SQLite supports ALTER TABLE ADD COLUMN for nullable columns with no default —
+    this is safe, non-destructive, and does not rewrite the table.
+    Idempotent: reads sqlite_master DDL first and skips if bar_date already present.
+    """
+    try:
+        rows = _db().execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_log'"
+        )
+    except Exception as exc:
+        logger.warning("V3 migration: could not read sqlite_master (%s) — skipping", exc)
+        return
+
+    if not rows:
+        return  # table doesn't exist yet; fresh _SCHEMA_SQL DDL creates it with bar_date
+
+    table_sql: str = (rows[0].get("sql") or "")
+    if "bar_date" in table_sql:
+        return  # already migrated
+
+    try:
+        _db().execute("ALTER TABLE alert_log ADD COLUMN bar_date TEXT")
+        logger.info("V3 migration: added bar_date column to alert_log")
+    except Exception as exc:
+        logger.error("V3 migration failed: %s", exc)
 
 
 def init_schema() -> None:
@@ -411,6 +447,7 @@ def init_schema() -> None:
     """
     _db().execute_script(_SCHEMA_SQL)
     _migrate_alert_log_v2()
+    _migrate_alert_log_v3()
     logger.info("Schema initialised (or already up to date)")
 
 
@@ -580,6 +617,27 @@ def get_recent_touches(
     return [date.fromisoformat(r["touch_date"]) for r in rows]
 
 
+def get_touches_since(
+    ticker: str,
+    timeframe: str,
+    ma_period: int,
+    since_date: date,
+) -> list[date]:
+    """Return touches on or after since_date for this MA.
+
+    Used by detect_3c_touch_accumulation to apply a trading-day window:
+    the caller derives since_date from the daily_df DatetimeIndex so that
+    the window tracks trading days, not calendar days.
+    """
+    rows = _db().execute(
+        "SELECT touch_date FROM touch_log "
+        "WHERE ticker = ? AND timeframe = ? AND ma_period = ? AND touch_date >= ? "
+        "ORDER BY touch_date ASC",
+        [ticker, timeframe, ma_period, since_date.isoformat()],
+    )
+    return [date.fromisoformat(r["touch_date"]) for r in rows]
+
+
 def prune_old_touches(window_days: int) -> int:
     """Delete touch_log rows older than window_days (calendar days). Returns count deleted."""
     cutoff = (date.today() - timedelta(days=window_days)).isoformat()
@@ -644,13 +702,68 @@ def mark_warning_sent(ticker: str) -> None:
 # Alert log
 # ---------------------------------------------------------------------------
 
+def get_last_fired_bar_date(
+    ticker: str,
+    timeframe: str,
+    ma_period: int,
+    signal_type: str,
+) -> date | None:
+    """
+    Return the bar_date of the most recently fired alert for this signal key, or None.
+
+    Used by W/M detector gate: if the current completed bar's date is not newer
+    than the last-fired bar_date, the signal has already been dispatched for that
+    bar and must be suppressed.
+    """
+    rows = _db().execute(
+        "SELECT bar_date FROM alert_log "
+        "WHERE ticker = ? AND signal_type = ? AND timeframe = ? AND ma_period = ? "
+        "AND bar_date IS NOT NULL "
+        "ORDER BY bar_date DESC LIMIT 1",
+        [ticker, signal_type, timeframe, ma_period],
+    )
+    if rows and rows[0].get("bar_date"):
+        return date.fromisoformat(rows[0]["bar_date"])
+    return None
+
+
+def recent_alert_exists(
+    ticker: str,
+    ma_period: int | None,
+    timeframe: str | None,
+    signal_type: str,
+    days: int = 5,
+) -> bool:
+    """
+    Return True if a matching alert fired within the last `days` days.
+
+    Used by the dispatch cooldown gate to suppress duplicate alerts.
+    Matches on (ticker, signal_type, timeframe, ma_period) — all four columns.
+    NULL-safe: timeframe and ma_period are compared with IS so NULL rows match
+    correctly when the signal has no timeframe/period (e.g. HALT_WARNING).
+    """
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = _db().execute(
+        "SELECT id FROM alert_log "
+        "WHERE ticker = ? AND signal_type = ? "
+        "AND timeframe IS ? AND ma_period IS ? "
+        "AND fired_at >= ? LIMIT 1",
+        [ticker, signal_type, timeframe, ma_period, cutoff],
+    )
+    return bool(rows)
+
+
 def insert_alert(alert: dict) -> None:
     """Append-only insert into alert_log."""
+    bar_date_raw = alert.get("bar_date")
+    bar_date_str: str | None = (
+        bar_date_raw.isoformat() if isinstance(bar_date_raw, date) else bar_date_raw
+    )
     _db().execute(
         "INSERT INTO alert_log "
         "(ticker, signal_type, timeframe, ma_period, price_at_fire, ma_value, "
-        " volume_ratio, extra_json, fired_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " volume_ratio, extra_json, bar_date, fired_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             alert.get("ticker"),
             alert.get("signal_type"),
@@ -660,6 +773,7 @@ def insert_alert(alert: dict) -> None:
             alert.get("ma_value"),
             alert.get("volume_ratio"),
             json.dumps(alert.get("extra", {})),
+            bar_date_str,
             alert.get("fired_at", datetime.utcnow().isoformat() + "Z"),
         ],
     )

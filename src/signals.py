@@ -165,6 +165,7 @@ def build_alert(
     ma_value: float,
     extra: dict,
     volume_ratio: float | None = None,
+    bar_date: date | None = None,
 ) -> dict:
     """Construct a standardised alert dict used downstream by alerter.py."""
     return {
@@ -176,6 +177,7 @@ def build_alert(
         "ma_value": ma_value,
         "volume_ratio": volume_ratio,
         "extra": extra,
+        "bar_date": bar_date,
         "fired_at": _utcnow_iso(),
     }
 
@@ -268,6 +270,16 @@ def detect_3a_ma_support(
             bar_close = float(bar["close"])
             touch_date = bar.name.date()
 
+            # W/M bar gate: suppress if this completed bar already fired a signal.
+            # Prevents the detector re-firing every daily scan while conditions hold.
+            last_bar = db.get_last_fired_bar_date(ticker, tf, winner_period, "MA_SUPPORT")
+            if last_bar is not None and touch_date <= last_bar:
+                logger.debug(
+                    "3A W/M gate: skip %s %s%d — bar %s already fired (last_bar=%s)",
+                    ticker, tf, winner_period, touch_date, last_bar,
+                )
+                continue
+
         # Wick condition: bar low ≤ MA value
         wick_touched = bar_low <= ma_val
         # Close condition: bar close > MA value
@@ -312,6 +324,7 @@ def detect_3a_ma_support(
             ma_value=ma_val,
             extra=extra,
             volume_ratio=vol_ratio,
+            bar_date=touch_date,
         )
         alerts.append(alert)
         logger.info("%s fired for %s %s%d @ %.4f", label_for("3a"), ticker, tf, winner_period, today_close)
@@ -398,6 +411,7 @@ def detect_3b_reclaim(
                     "new_step": max(1, current_step - 1),
                 },
                 volume_ratio=None,
+                bar_date=today_date,
             )
             logger.info(
                 "%s confirmed for %s D%d — streak=%d", label_for("3b"), ticker, ma_period, new_streak
@@ -477,7 +491,28 @@ def detect_3c_touch_accumulation(
             continue
         ma_val = float(ma_val_raw)
 
-        recent_touches = db.get_recent_touches(ticker, tf, winner_period, TOUCH_WINDOW_DAYS)
+        # Bar date for this signal: last completed bar for W/M, today for D.
+        if tf != "D":
+            current_bar_date = eval_df.index[-1].date()
+        else:
+            current_bar_date = today_date
+
+        # W/M bar gate: suppress if this completed bar already fired a 3C signal.
+        if tf in ("W", "M"):
+            last_bar = db.get_last_fired_bar_date(ticker, tf, winner_period, "TOUCH_ACCUMULATION")
+            if last_bar is not None and current_bar_date <= last_bar:
+                logger.debug(
+                    "3C W/M gate: skip %s %s%d — bar %s already fired (last_bar=%s)",
+                    ticker, tf, winner_period, current_bar_date, last_bar,
+                )
+                continue
+
+        # 15-trading-day window: 15th-from-last row in daily_df is the cutoff.
+        # daily_df is indexed by contiguous trading days, so this is exact —
+        # no calendar-day approximation, no holiday drift.
+        _n = min(15, len(daily_df))
+        trading_cutoff = daily_df.index[-_n].date()
+        recent_touches = db.get_touches_since(ticker, tf, winner_period, trading_cutoff)
         count = len(recent_touches)
 
         if count >= TOUCH_THRESHOLD:
@@ -494,6 +529,7 @@ def detect_3c_touch_accumulation(
                     "touch_dates": touch_date_strs,
                 },
                 volume_ratio=None,
+                bar_date=current_bar_date,
             )
             alerts.append(alert)
             logger.info(
@@ -593,6 +629,7 @@ def detect_3d(
 
     volume_ratio = round(today_vol / volume_avg_20d, 2)
 
+    today_date_3d = daily_df.index[-1].date()
     alert = build_alert(
         ticker=ticker,
         signal_type="3D",
@@ -602,6 +639,7 @@ def detect_3d(
         ma_value=d20,
         extra={"low": today_low, "close": today_close},
         volume_ratio=volume_ratio,
+        bar_date=today_date_3d,
     )
     logger.info(
         "3D fired for %s @ %.4f — vol %.2f× avg, D20=%.2f>D50=%.2f>D100=%.2f>D150=%.2f>D200=%.2f",

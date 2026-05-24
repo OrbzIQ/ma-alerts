@@ -56,19 +56,23 @@ CREATE INDEX IF NOT EXISTS idx_touch_lookup
 CREATE TABLE IF NOT EXISTS alert_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker          TEXT NOT NULL,
-    signal_type     TEXT NOT NULL CHECK (signal_type IN ('MA_SUPPORT', 'RECLAIM', 'TOUCH_ACCUMULATION', 'HALT_WARNING')),
+    signal_type     TEXT NOT NULL,
     timeframe       TEXT CHECK (timeframe IN ('D', 'W', 'M', NULL)),
     ma_period       INTEGER,
     price_at_fire   REAL,
     ma_value        REAL,
     volume_ratio    REAL,
     extra_json      TEXT,                         -- signal-specific fields as JSON
+    bar_date        TEXT,                         -- ISO date of the bar that triggered the signal
     fired_at        TEXT NOT NULL,                -- UTC ISO 8601
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
 );
 
 CREATE INDEX IF NOT EXISTS idx_alert_log_ticker_time
   ON alert_log(ticker, fired_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_alert_log_dedup
+  ON alert_log(ticker, ma_period, timeframe, signal_type);
 
 CREATE TABLE IF NOT EXISTS data_health (
     ticker                  TEXT NOT NULL PRIMARY KEY,
