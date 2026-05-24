@@ -18,6 +18,7 @@ import requests
 from dotenv import load_dotenv
 
 import src.db as db
+from src.labels import label_for
 
 load_dotenv()
 
@@ -96,7 +97,7 @@ def _format_3a(alert: dict) -> str:
         f"MA Value:     {ma_val} \\({_escape_md2(f'{period} MA')}\\)\n"
         f"Volume:       {vol_str}\n"
         f"Timeframe:    {tf_label}\n"
-        f"Signal Type:  {_escape_md2('MA Support Hold')}\n"
+        f"Signal Type:  {_escape_md2(label_for('3a'))}\n"
         f"Touch count:  {_escape_md2(f'{touch_count} of 3 (within 15-day window)')}\n"
         f"\n"
         f"Wick low touched {wick_low}, closed at {price}\n"
@@ -117,7 +118,7 @@ def _format_3b(alert: dict) -> str:
     new_step = extra.get("new_step", "?")
 
     return (
-        f"✅ {ticker} — {_escape_md2(f'D{period}')} {_escape_md2('Reclaim Confirmed')}\n"
+        f"✅ {ticker} — {_escape_md2(f'D{period}')} {_escape_md2(label_for('3b'))}\n"
         f"\n"
         f"MA reclaimed:     {_escape_md2(f'D{period}')} @ {ma_val}\n"
         f"Consecutive days: {_escape_md2(f'{streak} closes above')}\n"
@@ -152,7 +153,7 @@ def _format_3c(alert: dict) -> str:
     dates_str = _escape_md2(" · ".join(formatted_dates) if formatted_dates else "N/A")
 
     return (
-        f"🔁 {ticker} — {tf_label} {ma_label} {_escape_md2('Support Accumulation')}\n"
+        f"🔁 {ticker} — {tf_label} {ma_label} {_escape_md2(label_for('3c'))}\n"
         f"\n"
         f"Touch count:  {_escape_md2(f'{touch_count} of 3 within 15 days')}\n"
         f"MA Value:     {ma_val}\n"

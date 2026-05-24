@@ -351,6 +351,105 @@ class TestSignalOrdering:
 
 
 # ---------------------------------------------------------------------------
+# Completed-bar rule for W/M signals
+# ---------------------------------------------------------------------------
+
+class TestWeeklyBarCompletedBarRule:
+    """3A and 3C must evaluate W/M conditions against completed bars only."""
+
+    def test_3a_w_signal_requires_completed_weekly_bar_close_above_ma(self):
+        """
+        3A must NOT fire a W signal when the last completed weekly bar closed BELOW
+        the W MA — even if today's daily bar wicks the W MA and closes above it.
+
+        This is the exact bug that was fixed: the old code checked today's daily
+        bar against the W MA, so a strong daily close would incorrectly trigger a
+        W support alert even when the weekly bar itself confirmed no support.
+        """
+        from src.resample import resample_to_weekly
+        import src.db as db
+        from src.signals import detect_3a_ma_support
+        from src.config import TOUCH_WINDOW_DAYS
+
+        # 300-day uptrend so D/W/M MAs are well-defined
+        df = _make_daily_df(n=300, base_close=250.0, volume=3_000_000)
+        _add_mas(df, (50, 100, 150, 200))
+
+        weekly_df = resample_to_weekly(df)
+        _add_mas(weekly_df, (50, 100, 150, 200))
+
+        today_date = df.index[-1].date()
+
+        # Identify last completed weekly bar (index.date strictly before today)
+        completed_mask = weekly_df.index.date < today_date
+        assert completed_mask.any(), "Fixture must have at least one completed weekly bar"
+        last_completed_idx = weekly_df[completed_mask].index[-1]
+
+        w100_val = float(weekly_df.at[last_completed_idx, "ma_100"])
+
+        # Force last completed weekly bar: wick touches W100, close BELOW W100 — no support
+        weekly_df.at[last_completed_idx, "low"]   = w100_val - 1.0
+        weekly_df.at[last_completed_idx, "close"] = w100_val - 0.50
+
+        # Today's daily bar: price above W100 (proximity check passes), high volume.
+        # Old buggy code would have evaluated THIS bar against the W MA and fired.
+        df.iloc[-1, df.columns.get_loc("low")]    = w100_val - 0.50
+        df.iloc[-1, df.columns.get_loc("close")]  = w100_val + 5.0
+        df.iloc[-1, df.columns.get_loc("volume")] = 9_000_000
+
+        # cascade_step=2 includes W100 checks
+        alerts = detect_3a_ma_support("TEST", df, weekly_df, _empty_df(), cascade_step=2)
+        w_alerts = [a for a in alerts if a["timeframe"] == "W"]
+
+        assert len(w_alerts) == 0, (
+            "3A must not fire a W signal when the completed weekly bar closed below W MA"
+        )
+        w_touches = db.get_recent_touches("TEST", "W", 100, TOUCH_WINDOW_DAYS)
+        assert len(w_touches) == 0, (
+            "No W touch should be recorded when the weekly bar closed below W MA"
+        )
+
+    def test_3a_w_signal_fires_when_completed_weekly_bar_wicks_and_closes_above(self):
+        """
+        Positive case: 3A DOES fire a W signal when the last completed weekly bar
+        wicked the W MA (low <= W MA) AND closed above it (close > W MA), AND
+        today's daily volume is sufficient.
+        """
+        from src.resample import resample_to_weekly
+        from src.signals import detect_3a_ma_support
+
+        # n=700 daily → ~140 weekly bars; ma_100 on weekly requires >= 100 bars.
+        df = _make_daily_df(n=700, base_close=250.0, volume=3_000_000)
+        _add_mas(df, (50, 100, 150, 200))
+
+        weekly_df = resample_to_weekly(df)
+        _add_mas(weekly_df, (50, 100, 150, 200))
+
+        today_date = df.index[-1].date()
+
+        completed_mask = weekly_df.index.date < today_date
+        assert completed_mask.any()
+        last_completed_idx = weekly_df[completed_mask].index[-1]
+
+        w100_val = float(weekly_df.at[last_completed_idx, "ma_100"])
+
+        # Completed weekly bar: wicks W100, closes ABOVE W100 — valid support
+        weekly_df.at[last_completed_idx, "low"]   = w100_val - 1.0
+        weekly_df.at[last_completed_idx, "close"] = w100_val + 2.0
+
+        # Today's daily bar: price above W100, sufficient volume
+        df.iloc[-1, df.columns.get_loc("close")]  = w100_val + 5.0
+        df.iloc[-1, df.columns.get_loc("volume")] = 9_000_000
+
+        alerts = detect_3a_ma_support("TEST", df, weekly_df, _empty_df(), cascade_step=2)
+        w_alerts = [a for a in alerts if a["timeframe"] == "W"]
+
+        assert len(w_alerts) >= 1, (
+            "3A should fire a W signal when the completed weekly bar wicked and closed above W MA"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Signal 3D -- D20 Momentum Touch
 # ---------------------------------------------------------------------------
 
