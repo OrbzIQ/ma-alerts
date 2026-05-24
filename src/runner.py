@@ -35,7 +35,7 @@ import argparse
 import logging
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 from dotenv import load_dotenv
 
@@ -152,6 +152,22 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
             logger.warning("No OHLCV in DB for %s after upsert", ticker)
             return []
 
+        # 4e-bis. OHLCV freshness gate (L6).
+        # Count business days (Mon–Fri) between the last stored bar and today.
+        # > 2 means the data is too stale to trust for signal detection — skip.
+        import pandas as pd
+        _last_bar = daily_df.index[-1].date()
+        _stale_days = len(pd.bdate_range(
+            start=_last_bar + timedelta(days=1),
+            end=date.today(),
+        ))
+        if _stale_days > 2:
+            logger.warning(
+                "Skipping %s — OHLCV stale by %d trading days (last bar: %s)",
+                ticker, _stale_days, _last_bar,
+            )
+            return []
+
         compute_ma(daily_df, MA_PERIODS_DAILY)  # includes D20 for 3D signal
         weekly_df = resample_to_weekly(daily_df)
         compute_ma(weekly_df, MA_PERIODS)
@@ -182,7 +198,7 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
             db.set_cascade_state(ticker, transition["to_step"], transition["broken_ma"])
             # Clear stale reclaim streak for the newly broken MA
             old_ma_period = int(transition["broken_ma"].lstrip("D"))
-            db.set_reclaim_streak(ticker, old_ma_period, 0, None)
+            db.set_reclaim_streak(ticker, "D", old_ma_period, 0, None)
             # Reload updated state
             cascade_state = db.get_cascade_state(ticker)
             logger.info(
@@ -191,6 +207,23 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
                 transition["from_step"],
                 transition["to_step"],
             )
+
+            # L5: Log intermediate Daily touches for multi-step gap-downs.
+            # A gap from step F to step T skips MAs at steps F+1 … T.
+            # Each crossed MA gets a touch record so 3C has accurate history.
+            from_step = transition["from_step"]
+            to_step = transition["to_step"]
+            if to_step - from_step > 1:
+                from src.config import CASCADE_MA_BY_STEP
+                today_date = date.today()
+                for step in range(from_step + 1, to_step + 1):
+                    period = CASCADE_MA_BY_STEP.get(step)
+                    if period is not None:
+                        db.record_touch(ticker, "D", period, today_date)
+                        logger.debug(
+                            "Intermediate touch logged for %s D%d (gap-down step %d→%d)",
+                            ticker, period, from_step, to_step,
+                        )
 
         cascade_step = cascade_state["current_step"]
 
@@ -204,15 +237,19 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
 
         # 3B: skip if a forward transition fired this run
         if not transition:
-            reclaim_alert = detect_3b_reclaim(ticker, daily_df, cascade_state)
-            if reclaim_alert:
-                de_escalation = apply_reclaim_de_escalation(ticker, cascade_state)
-                if de_escalation:
-                    db.set_cascade_state(
-                        ticker,
-                        de_escalation["new_step"],
-                        de_escalation["new_broken_ma"],
-                    )
+            reclaim_alerts = detect_3b_reclaim(
+                ticker, daily_df, weekly_df, monthly_df, cascade_state, cascade_step
+            )
+            for reclaim_alert in reclaim_alerts:
+                # Only Daily reclaim triggers cascade de-escalation
+                if reclaim_alert.get("timeframe") == "D":
+                    de_escalation = apply_reclaim_de_escalation(ticker, cascade_state)
+                    if de_escalation:
+                        db.set_cascade_state(
+                            ticker,
+                            de_escalation["new_step"],
+                            de_escalation["new_broken_ma"],
+                        )
                 alerts.append(reclaim_alert)
 
         # 3D: stateless, runs unconditionally; receives post-transition cascade_step

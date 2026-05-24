@@ -9,7 +9,10 @@ Key invariants:
     Within each timeframe group at the current cascade step, find the highest-period
     MA whose value is still below current price and use only that one MA.
 
-Volume comparator for 3A is ALWAYS 20-day daily volume, regardless of signal timeframe.
+Volume comparator for 3A is timeframe-aware: Daily signals use the last 20 completed
+daily bar volumes; Weekly uses the last 20 completed weekly bar volumes; Monthly uses
+the last 20 completed monthly bar volumes. Median is used (not mean) so outlier bars
+do not inflate the threshold. Threshold remains 1.5×.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ from src.config import (
     MA_PERIODS_DAILY,
     MOMENTUM_VOLUME_MULTIPLIER,
     RECLAIM_STREAK_DAYS,
+    RECLAIM_STREAK_DAYS_MONTHLY,
+    RECLAIM_STREAK_DAYS_WEEKLY,
     TOUCH_THRESHOLD,
     TOUCH_WINDOW_DAYS,
     VOLUME_LOOKBACK_DAYS,
@@ -64,15 +69,22 @@ def _get_timeframe_df(
     raise ValueError(f"Unknown timeframe: {timeframe!r}")
 
 
-def _compute_avg_daily_volume(daily_df: pd.DataFrame) -> float | None:
-    """Return the 20-day average daily volume (excludes today). Always uses daily bars.
+def _compute_median_volume(df: pd.DataFrame, today: date, n: int = 20) -> float | None:
+    """Return the median volume of the last n completed bars in df.
 
-    Uses iloc[-21:-1] — 20 bars ending yesterday — as the canonical slice (§A.1).
-    Requires at least VOLUME_LOOKBACK_DAYS + 1 rows (today + 20 history bars).
+    Completed means index.date strictly before today — same rule as
+    _latest_completed_bar. Works for any timeframe (D/W/M): pass daily_df,
+    weekly_df, or monthly_df respectively.
+
+    Returns None if fewer than n completed bars are available, which causes the
+    volume filter to fail safe (volume_ok = False).
     """
-    if daily_df.empty or len(daily_df) < VOLUME_LOOKBACK_DAYS + 1:
+    if df.empty:
         return None
-    return float(daily_df["volume"].iloc[-(VOLUME_LOOKBACK_DAYS + 1):-1].mean())
+    completed = df[df.index.date < today]
+    if len(completed) < n:
+        return None
+    return float(completed["volume"].iloc[-n:].median())
 
 
 def _get_proximity_winner(
@@ -165,6 +177,7 @@ def build_alert(
     ma_value: float,
     extra: dict,
     volume_ratio: float | None = None,
+    bar_date: date | None = None,
 ) -> dict:
     """Construct a standardised alert dict used downstream by alerter.py."""
     return {
@@ -176,6 +189,7 @@ def build_alert(
         "ma_value": ma_value,
         "volume_ratio": volume_ratio,
         "extra": extra,
+        "bar_date": bar_date,
         "fired_at": _utcnow_iso(),
     }
 
@@ -220,8 +234,6 @@ def detect_3a_ma_support(
     today_low: float = float(today_bar["low"])
     today_date: date = daily_df.index[-1].date()
 
-    avg_volume = _compute_avg_daily_volume(daily_df)
-
     checks = CASCADE_CHECKS.get(cascade_step, [])
 
     # Group checks by timeframe
@@ -260,6 +272,7 @@ def detect_3a_ma_support(
             bar_low = today_low
             bar_close = today_close
             touch_date = today_date
+            bar_volume = float(today_bar["volume"])
         else:  # W or M
             bar = _latest_completed_bar(df, today_date)
             if bar is None:
@@ -267,18 +280,29 @@ def detect_3a_ma_support(
             bar_low = float(bar["low"])
             bar_close = float(bar["close"])
             touch_date = bar.name.date()
+            # Volume confirmation for W/M uses today's DAILY bar and daily median.
+            # The completed W/M bar defines the wick/close; today's session volume
+            # confirms that price is actively finding support at the level right now.
+            bar_volume = float(today_bar["volume"])
+
+            # W/M bar gate: suppress if this completed bar already fired a signal.
+            # Prevents the detector re-firing every daily scan while conditions hold.
+            last_bar = db.get_last_fired_bar_date(ticker, tf, winner_period, "MA_SUPPORT")
+            if last_bar is not None and touch_date <= last_bar:
+                logger.debug(
+                    "3A W/M gate: skip %s %s%d — bar %s already fired (last_bar=%s)",
+                    ticker, tf, winner_period, touch_date, last_bar,
+                )
+                continue
 
         # Wick condition: bar low ≤ MA value
         wick_touched = bar_low <= ma_val
         # Close condition: bar close > MA value
         closed_above = bar_close > ma_val
-        # Volume condition: always daily volume vs 20-day daily avg
-        if avg_volume is None:
-            volume_ok = False
-        else:
-            today_volume = float(today_bar["volume"])
-            vol_ratio = today_volume / avg_volume if avg_volume > 0 else 0.0
-            volume_ok = vol_ratio >= MOMENTUM_VOLUME_MULTIPLIER
+        # Volume condition: always use daily_df median (today's session confirms the touch).
+        median_vol = _compute_median_volume(daily_df, today_date, VOLUME_LOOKBACK_DAYS)
+        vol_ratio = bar_volume / median_vol if median_vol else 0.0
+        volume_ok = median_vol is not None and vol_ratio >= MOMENTUM_VOLUME_MULTIPLIER
 
         if not (wick_touched and closed_above and volume_ok):
             logger.debug(
@@ -312,6 +336,7 @@ def detect_3a_ma_support(
             ma_value=ma_val,
             extra=extra,
             volume_ratio=vol_ratio,
+            bar_date=touch_date,
         )
         alerts.append(alert)
         logger.info("%s fired for %s %s%d @ %.4f", label_for("3a"), ticker, tf, winner_period, today_close)
@@ -323,74 +348,82 @@ def detect_3a_ma_support(
 # Signal 3B — MA Reclaim
 # ---------------------------------------------------------------------------
 
-def detect_3b_reclaim(
+def _detect_3b_for_timeframe(
     ticker: str,
-    daily_df: pd.DataFrame,
+    df: pd.DataFrame,
+    timeframe: str,
+    ma_period: int,
     cascade_state: dict,
+    required_streak: int,
 ) -> dict | None:
     """
-    Detect MA Reclaim signal (3B).
+    Core reclaim logic for a single (timeframe, ma_period) combination.
 
-    Tracks consecutive daily closes above the broken Daily MA. Fires on day 7.
-    Any close below resets the streak to 0.
+    For W/M timeframes, each completed bar is counted at most once (guarded by
+    last_bar_date in reclaim_tracker). For Daily, every calendar day of scan is
+    a new bar so the guard is not needed but is harmless.
 
-    Args:
-        ticker:        Ticker symbol.
-        daily_df:      Full daily OHLCV DataFrame.
-        cascade_state: Dict from db.get_cascade_state().
-
-    Returns:
-        Alert dict on confirmation (streak = 7), or None.
+    Returns an alert dict when the streak reaches required_streak, else None.
     """
-    broken_ma_str: str = cascade_state.get("broken_ma", "NONE")
-    if broken_ma_str == "NONE":
-        return None
-
-    # Parse MA period from string, e.g. 'D100' → 100
-    try:
-        ma_period = int(broken_ma_str.lstrip("D"))
-    except ValueError:
-        logger.error("Cannot parse broken_ma: %r for %s", broken_ma_str, ticker)
-        return None
-
-    if daily_df.empty:
-        return None
-
     from src.config import MA_PERIODS
     from src.ma import compute_ma as _compute_ma
-    _compute_ma(daily_df, MA_PERIODS)
 
-    ma_val = latest_ma_value(daily_df, ma_period)
-    if ma_val is None:
-        logger.debug("MA%d not available for 3B on %s", ma_period, ticker)
+    if df is None or df.empty:
         return None
 
-    today_close = float(daily_df.iloc[-1]["close"])
-    today_date = daily_df.index[-1].date()
+    _compute_ma(df, MA_PERIODS)
 
-    tracker = db.get_reclaim_streak_full(ticker, ma_period)
+    bar = _latest_completed_bar(df, date.today())
+    if bar is None:
+        return None
+
+    bar_date_val: date = bar.name.date()
+    ma_col = f"ma_{ma_period}"
+    if ma_col not in bar.index or math.isnan(bar[ma_col]):
+        logger.debug("MA%d not available for 3B %s on %s", ma_period, timeframe, ticker)
+        return None
+
+    bar_close = float(bar["close"])
+    ma_val = float(bar[ma_col])
+
+    tracker = db.get_reclaim_streak_full(ticker, timeframe, ma_period)
     current_streak: int = tracker["consecutive_closes"]
     streak_start_raw = tracker["streak_start"]
+    last_bar_raw = tracker.get("last_bar_date")
+
     streak_start: date | None = (
         date.fromisoformat(streak_start_raw) if streak_start_raw else None
     )
+    last_bar_counted: date | None = (
+        date.fromisoformat(last_bar_raw) if last_bar_raw else None
+    )
 
-    if today_close > ma_val:
-        # Price closed above broken MA — increment streak
+    if bar_close > ma_val:
+        # Guard: do not count the same completed bar twice (critical for W/M scanned daily).
+        # Only applies to increments — resets are always allowed so a bar that fires on
+        # day N and closes below MA later that same day (or in test re-runs) still resets.
+        if last_bar_counted is not None and bar_date_val <= last_bar_counted:
+            logger.debug(
+                "3B %s %s%d: bar %s already counted, skipping",
+                ticker, timeframe, ma_period, bar_date_val,
+            )
+            return None
         new_streak = current_streak + 1
         if new_streak == 1:
-            streak_start = today_date
-        db.set_reclaim_streak(ticker, ma_period, new_streak, streak_start)
+            streak_start = bar_date_val
+        db.set_reclaim_streak(
+            ticker, timeframe, ma_period, new_streak, streak_start,
+            last_bar_date=bar_date_val,
+        )
 
-        if new_streak >= RECLAIM_STREAK_DAYS:
-            # Streak confirmed — fire alert
+        if new_streak >= required_streak:
             current_step = cascade_state.get("current_step", 1)
             alert = build_alert(
                 ticker=ticker,
                 signal_type="RECLAIM",
-                timeframe="D",
+                timeframe=timeframe,
                 ma_period=ma_period,
-                price=today_close,
+                price=bar_close,
                 ma_value=ma_val,
                 extra={
                     "streak": new_streak,
@@ -398,18 +431,114 @@ def detect_3b_reclaim(
                     "new_step": max(1, current_step - 1),
                 },
                 volume_ratio=None,
+                bar_date=bar_date_val,
             )
             logger.info(
-                "%s confirmed for %s D%d — streak=%d", label_for("3b"), ticker, ma_period, new_streak
+                "%s confirmed for %s %s%d — streak=%d",
+                label_for("3b"), ticker, timeframe, ma_period, new_streak,
             )
             return alert
     else:
-        # Price closed below broken MA — reset streak
+        # Close at or below MA — reset streak
         if current_streak > 0:
-            logger.debug("3B streak reset for %s D%d", ticker, ma_period)
-        db.set_reclaim_streak(ticker, ma_period, 0, None)
+            logger.debug("3B streak reset for %s %s%d", ticker, timeframe, ma_period)
+        db.set_reclaim_streak(
+            ticker, timeframe, ma_period, 0, None,
+            last_bar_date=bar_date_val,
+        )
 
     return None
+
+
+def detect_3b_reclaim(
+    ticker: str,
+    daily_df: pd.DataFrame,
+    weekly_df: pd.DataFrame | None = None,
+    monthly_df: pd.DataFrame | None = None,
+    cascade_state: dict | None = None,
+    cascade_step: int | None = None,
+) -> list[dict] | dict | None:
+    """
+    Detect MA Reclaim signals (3B) across Daily, Weekly, and Monthly timeframes.
+
+    Daily: tracks 7 consecutive daily closes above the broken Daily MA.
+    Weekly: tracks 2 consecutive completed weekly closes above *any* broken W MA
+            at the current cascade step.
+    Monthly: tracks 2 consecutive completed monthly closes above *any* broken M MA
+             at the current cascade step.
+
+    Only Daily reclaim triggers a cascade de-escalation (caller's responsibility).
+
+    Backward-compatible: old 3-arg call (ticker, daily_df, cascade_state) still works —
+    returns dict | None (old shape). Full 6-arg call returns list[dict] (new shape).
+
+    Args:
+        ticker:        Ticker symbol.
+        daily_df:      Full daily OHLCV DataFrame (pre-indexed by date).
+        weekly_df:     Resampled weekly OHLCV DataFrame. None → Daily-only compat mode.
+        monthly_df:    Resampled monthly OHLCV DataFrame. None → Daily-only compat mode.
+        cascade_state: Dict from db.get_cascade_state(). In compat mode, passed as 3rd arg.
+        cascade_step:  Current cascade step (1–5). None → Daily-only compat mode.
+
+    Returns:
+        list[dict] in full mode; dict | None in compat (3-arg) mode.
+    """
+    # --- Backward-compat detection ---
+    # Old call: detect_3b_reclaim(ticker, daily_df, cascade_state_dict)
+    # In that case weekly_df receives the cascade_state dict.
+    _compat_mode = isinstance(weekly_df, dict) or weekly_df is None and cascade_step is None
+    if isinstance(weekly_df, dict):
+        # 3-arg old-style call: weekly_df slot holds cascade_state
+        cascade_state = weekly_df
+        weekly_df = None
+        monthly_df = None
+        cascade_step = None
+
+    if cascade_state is None:
+        cascade_state = {}
+
+    alerts: list[dict] = []
+
+    # --- Daily reclaim (broken_ma from cascade_state) ---
+    broken_ma_str: str = cascade_state.get("broken_ma", "NONE")
+    if broken_ma_str != "NONE":
+        try:
+            d_ma_period = int(broken_ma_str.lstrip("D"))
+        except ValueError:
+            logger.error("Cannot parse broken_ma: %r for %s", broken_ma_str, ticker)
+            d_ma_period = None
+
+        if d_ma_period is not None:
+            alert = _detect_3b_for_timeframe(
+                ticker, daily_df, "D", d_ma_period, cascade_state, RECLAIM_STREAK_DAYS,
+            )
+            if alert:
+                alerts.append(alert)
+
+    # --- Weekly and Monthly reclaim (MAs at current cascade step) ---
+    # Skipped in compat mode (cascade_step is None)
+    if cascade_step is not None:
+        step_checks = CASCADE_CHECKS.get(cascade_step, [])
+        for tf, period in step_checks:
+            if tf == "W" and weekly_df is not None:
+                alert = _detect_3b_for_timeframe(
+                    ticker, weekly_df, "W", period, cascade_state, RECLAIM_STREAK_DAYS_WEEKLY,
+                )
+                if alert:
+                    alerts.append(alert)
+            elif tf == "M" and monthly_df is not None:
+                alert = _detect_3b_for_timeframe(
+                    ticker, monthly_df, "M", period, cascade_state, RECLAIM_STREAK_DAYS_MONTHLY,
+                )
+                if alert:
+                    alerts.append(alert)
+
+    # --- Return shape ---
+    # Compat mode (3-arg old callers): return dict | None
+    if _compat_mode:
+        return alerts[0] if alerts else None
+
+    return alerts
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +606,28 @@ def detect_3c_touch_accumulation(
             continue
         ma_val = float(ma_val_raw)
 
-        recent_touches = db.get_recent_touches(ticker, tf, winner_period, TOUCH_WINDOW_DAYS)
+        # Bar date for this signal: last completed bar for W/M, today for D.
+        if tf != "D":
+            current_bar_date = eval_df.index[-1].date()
+        else:
+            current_bar_date = today_date
+
+        # W/M bar gate: suppress if this completed bar already fired a 3C signal.
+        if tf in ("W", "M"):
+            last_bar = db.get_last_fired_bar_date(ticker, tf, winner_period, "TOUCH_ACCUMULATION")
+            if last_bar is not None and current_bar_date <= last_bar:
+                logger.debug(
+                    "3C W/M gate: skip %s %s%d — bar %s already fired (last_bar=%s)",
+                    ticker, tf, winner_period, current_bar_date, last_bar,
+                )
+                continue
+
+        # 15-trading-day window: 15th-from-last row in daily_df is the cutoff.
+        # daily_df is indexed by contiguous trading days, so this is exact —
+        # no calendar-day approximation, no holiday drift.
+        _n = min(15, len(daily_df))
+        trading_cutoff = daily_df.index[-_n].date()
+        recent_touches = db.get_touches_since(ticker, tf, winner_period, trading_cutoff)
         count = len(recent_touches)
 
         if count >= TOUCH_THRESHOLD:
@@ -494,6 +644,7 @@ def detect_3c_touch_accumulation(
                     "touch_dates": touch_date_strs,
                 },
                 volume_ratio=None,
+                bar_date=current_bar_date,
             )
             alerts.append(alert)
             logger.info(
@@ -570,29 +721,32 @@ def detect_3d(
         )
         return None
 
-    today_bar   = daily_df.iloc[-1]
-    today_low   = float(today_bar["low"])
-    today_close = float(today_bar["close"])
-    today_vol   = float(today_bar["volume"])
+    today_bar     = daily_df.iloc[-1]
+    today_low     = float(today_bar["low"])
+    today_close   = float(today_bar["close"])
+    today_vol     = float(today_bar["volume"])
+    today_date_3d = daily_df.index[-1].date()
 
-    # Volume average: canonical 20-bar slice ending yesterday
-    volume_avg_20d = float(daily_df["volume"].iloc[-21:-1].mean())
+    # Volume median: last 20 completed daily bars (strictly before today).
+    vol_median_3d = _compute_median_volume(daily_df, today_date_3d, VOLUME_LOOKBACK_DAYS)
+    if vol_median_3d is None:
+        logger.debug("3D: insufficient history for volume median on %s", ticker)
+        return None
 
     # Trigger conditions
     wick_touched = today_low <= d20
     closed_above = today_close > d20
-    volume_ok    = today_vol >= MOMENTUM_VOLUME_MULTIPLIER * volume_avg_20d
+    volume_ok    = today_vol >= MOMENTUM_VOLUME_MULTIPLIER * vol_median_3d
 
     if not (wick_touched and closed_above and volume_ok):
         logger.debug(
-            "3D not triggered for %s: wick=%s close=%s vol=%s (%.2f× avg)",
+            "3D not triggered for %s: wick=%s close=%s vol=%s (%.2f× median)",
             ticker, wick_touched, closed_above, volume_ok,
-            today_vol / volume_avg_20d if volume_avg_20d > 0 else 0.0,
+            today_vol / vol_median_3d if vol_median_3d > 0 else 0.0,
         )
         return None
 
-    volume_ratio = round(today_vol / volume_avg_20d, 2)
-
+    volume_ratio = round(today_vol / vol_median_3d, 2)
     alert = build_alert(
         ticker=ticker,
         signal_type="3D",
@@ -602,6 +756,7 @@ def detect_3d(
         ma_value=d20,
         extra={"low": today_low, "close": today_close},
         volume_ratio=volume_ratio,
+        bar_date=today_date_3d,
     )
     logger.info(
         "3D fired for %s @ %.4f — vol %.2f× avg, D20=%.2f>D50=%.2f>D100=%.2f>D150=%.2f>D200=%.2f",

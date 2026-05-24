@@ -61,11 +61,13 @@ CREATE TABLE IF NOT EXISTS cascade_state (
 
 CREATE TABLE IF NOT EXISTS reclaim_tracker (
     ticker              TEXT NOT NULL,
+    timeframe           TEXT NOT NULL DEFAULT 'D' CHECK (timeframe IN ('D', 'W', 'M')),
     ma_period           INTEGER NOT NULL,
     consecutive_closes  INTEGER NOT NULL DEFAULT 0,
     streak_start        DATE,
+    last_bar_date       TEXT,                        -- most recently counted bar date (idempotency)
     last_updated        DATE NOT NULL,
-    PRIMARY KEY (ticker, ma_period),
+    PRIMARY KEY (ticker, timeframe, ma_period),
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
 );
 
@@ -92,12 +94,16 @@ CREATE TABLE IF NOT EXISTS alert_log (
     ma_value        REAL,
     volume_ratio    REAL,
     extra_json      TEXT,
+    bar_date        TEXT,                         -- ISO date of the bar that triggered the signal
     fired_at        TEXT NOT NULL,
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
 );
 
 CREATE INDEX IF NOT EXISTS idx_alert_log_ticker_time
   ON alert_log(ticker, fired_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_alert_log_dedup
+  ON alert_log(ticker, ma_period, timeframe, signal_type);
 
 CREATE TABLE IF NOT EXISTS data_health (
     ticker                  TEXT NOT NULL PRIMARY KEY,
@@ -398,11 +404,93 @@ def _migrate_alert_log_v2() -> None:
             DROP TABLE alert_log;
             ALTER TABLE alert_log_v2 RENAME TO alert_log;
             CREATE INDEX IF NOT EXISTS idx_alert_log_ticker_time
-              ON alert_log(ticker, fired_at DESC)
+              ON alert_log(ticker, fired_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_alert_log_dedup
+              ON alert_log(ticker, ma_period, timeframe, signal_type)
         """)
         logger.info("V2 migration complete — alert_log signal_type CHECK constraint removed")
     except Exception as exc:
         logger.error("V2 migration failed: %s", exc)
+
+
+def _migrate_alert_log_v3() -> None:
+    """
+    V3 migration: add bar_date TEXT column to alert_log.
+
+    SQLite supports ALTER TABLE ADD COLUMN for nullable columns with no default —
+    this is safe, non-destructive, and does not rewrite the table.
+    Idempotent: reads sqlite_master DDL first and skips if bar_date already present.
+    """
+    try:
+        rows = _db().execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_log'"
+        )
+    except Exception as exc:
+        logger.warning("V3 migration: could not read sqlite_master (%s) — skipping", exc)
+        return
+
+    if not rows:
+        return  # table doesn't exist yet; fresh _SCHEMA_SQL DDL creates it with bar_date
+
+    table_sql: str = (rows[0].get("sql") or "")
+    if "bar_date" in table_sql:
+        return  # already migrated
+
+    try:
+        _db().execute("ALTER TABLE alert_log ADD COLUMN bar_date TEXT")
+        logger.info("V3 migration: added bar_date column to alert_log")
+    except Exception as exc:
+        logger.error("V3 migration failed: %s", exc)
+
+
+def _migrate_reclaim_tracker_v2() -> None:
+    """
+    V2 migration: add timeframe + last_bar_date columns to reclaim_tracker,
+    and extend the primary key to (ticker, timeframe, ma_period).
+
+    SQLite cannot ALTER TABLE to change a PK, so we recreate the table.
+    Existing Daily streaks are preserved with timeframe = 'D'.
+    Idempotent: checks sqlite_master for the timeframe column first.
+    """
+    try:
+        rows = _db().execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='reclaim_tracker'"
+        )
+    except Exception as exc:
+        logger.warning("reclaim_tracker V2 migration: sqlite_master read failed (%s) — skipping", exc)
+        return
+
+    if not rows:
+        return  # table doesn't exist yet; fresh _SCHEMA_SQL DDL will create it correctly
+
+    table_sql: str = (rows[0].get("sql") or "")
+    if "timeframe" in table_sql:
+        return  # already migrated
+
+    try:
+        _db().execute_script("""
+            CREATE TABLE reclaim_tracker_v2 (
+                ticker              TEXT NOT NULL,
+                timeframe           TEXT NOT NULL DEFAULT 'D',
+                ma_period           INTEGER NOT NULL,
+                consecutive_closes  INTEGER NOT NULL DEFAULT 0,
+                streak_start        DATE,
+                last_bar_date       TEXT,
+                last_updated        DATE NOT NULL,
+                PRIMARY KEY (ticker, timeframe, ma_period)
+            );
+            INSERT INTO reclaim_tracker_v2
+                (ticker, timeframe, ma_period, consecutive_closes,
+                 streak_start, last_bar_date, last_updated)
+            SELECT ticker, 'D', ma_period, consecutive_closes,
+                   streak_start, NULL, last_updated
+            FROM reclaim_tracker;
+            DROP TABLE reclaim_tracker;
+            ALTER TABLE reclaim_tracker_v2 RENAME TO reclaim_tracker
+        """)
+        logger.info("reclaim_tracker V2 migration complete — timeframe + last_bar_date added")
+    except Exception as exc:
+        logger.error("reclaim_tracker V2 migration failed: %s", exc)
 
 
 def init_schema() -> None:
@@ -411,6 +499,8 @@ def init_schema() -> None:
     """
     _db().execute_script(_SCHEMA_SQL)
     _migrate_alert_log_v2()
+    _migrate_alert_log_v3()
+    _migrate_reclaim_tracker_v2()
     logger.info("Schema initialised (or already up to date)")
 
 
@@ -506,44 +596,81 @@ def set_cascade_state(ticker: str, step: int, broken_ma: str) -> None:
 # Reclaim tracker
 # ---------------------------------------------------------------------------
 
-def get_reclaim_streak(ticker: str, ma_period: int) -> int:
-    """Returns current consecutive-closes-above count."""
+def get_reclaim_streak(ticker: str, timeframe_or_period, ma_period: int | None = None) -> int:
+    """
+    Returns current consecutive-closes-above count for (ticker, timeframe, ma_period).
+
+    Backward-compatible: old 2-arg call (ticker, ma_period) still works — timeframe
+    defaults to 'D'. New 3-arg call (ticker, timeframe, ma_period) is preferred.
+    """
+    if isinstance(timeframe_or_period, int):
+        # Old call shape: get_reclaim_streak(ticker, ma_period)
+        timeframe = "D"
+        period = timeframe_or_period
+    else:
+        timeframe = timeframe_or_period
+        period = ma_period
     rows = _db().execute(
-        "SELECT consecutive_closes FROM reclaim_tracker WHERE ticker = ? AND ma_period = ?",
-        [ticker, ma_period],
+        "SELECT consecutive_closes FROM reclaim_tracker "
+        "WHERE ticker = ? AND timeframe = ? AND ma_period = ?",
+        [ticker, timeframe, period],
     )
     return rows[0]["consecutive_closes"] if rows else 0
 
 
-def get_reclaim_streak_full(ticker: str, ma_period: int) -> dict:
+def get_reclaim_streak_full(ticker: str, timeframe: str, ma_period: int) -> dict:
     """Returns full reclaim tracker row as dict, or defaults if not found."""
     rows = _db().execute(
-        "SELECT consecutive_closes, streak_start, last_updated "
-        "FROM reclaim_tracker WHERE ticker = ? AND ma_period = ?",
-        [ticker, ma_period],
+        "SELECT consecutive_closes, streak_start, last_bar_date, last_updated "
+        "FROM reclaim_tracker WHERE ticker = ? AND timeframe = ? AND ma_period = ?",
+        [ticker, timeframe, ma_period],
     )
     if rows:
         return dict(rows[0])
-    return {"consecutive_closes": 0, "streak_start": None, "last_updated": None}
+    return {
+        "consecutive_closes": 0,
+        "streak_start": None,
+        "last_bar_date": None,
+        "last_updated": None,
+    }
 
 
 def set_reclaim_streak(
     ticker: str,
-    ma_period: int,
-    streak: int,
-    streak_start: date | None = None,
+    timeframe_or_period,
+    ma_period_or_streak,
+    streak_or_start=None,
+    streak_start_or_sentinel=None,
+    last_bar_date: date | None = None,
 ) -> None:
     """
-    Upsert reclaim streak for this ticker + MA period.
-    streak_start: the date the streak began; pass None when resetting streak to 0.
+    Upsert reclaim streak for this (ticker, timeframe, ma_period).
+
+    Backward-compatible with old 4-arg call (ticker, ma_period, streak, streak_start).
+    New 5-arg call (ticker, timeframe, ma_period, streak, streak_start) is preferred.
+    last_bar_date is keyword-only and always optional.
     """
+    if isinstance(timeframe_or_period, int):
+        # Old call shape: set_reclaim_streak(ticker, ma_period, streak, streak_start)
+        timeframe = "D"
+        ma_period = timeframe_or_period
+        streak = ma_period_or_streak
+        streak_start = streak_or_start
+    else:
+        # New call shape: set_reclaim_streak(ticker, timeframe, ma_period, streak, streak_start)
+        timeframe = timeframe_or_period
+        ma_period = ma_period_or_streak
+        streak = streak_or_start
+        streak_start = streak_start_or_sentinel
+
     today = date.today().isoformat()
     start_str = streak_start.isoformat() if streak_start else None
+    bar_str = last_bar_date.isoformat() if last_bar_date else None
     _db().execute(
         "INSERT OR REPLACE INTO reclaim_tracker "
-        "(ticker, ma_period, consecutive_closes, streak_start, last_updated) "
-        "VALUES (?, ?, ?, ?, ?)",
-        [ticker, ma_period, streak, start_str, today],
+        "(ticker, timeframe, ma_period, consecutive_closes, streak_start, last_bar_date, last_updated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [ticker, timeframe, ma_period, streak, start_str, bar_str, today],
     )
 
 
@@ -576,6 +703,27 @@ def get_recent_touches(
         "WHERE ticker = ? AND timeframe = ? AND ma_period = ? AND touch_date >= ? "
         "ORDER BY touch_date ASC",
         [ticker, timeframe, ma_period, cutoff],
+    )
+    return [date.fromisoformat(r["touch_date"]) for r in rows]
+
+
+def get_touches_since(
+    ticker: str,
+    timeframe: str,
+    ma_period: int,
+    since_date: date,
+) -> list[date]:
+    """Return touches on or after since_date for this MA.
+
+    Used by detect_3c_touch_accumulation to apply a trading-day window:
+    the caller derives since_date from the daily_df DatetimeIndex so that
+    the window tracks trading days, not calendar days.
+    """
+    rows = _db().execute(
+        "SELECT touch_date FROM touch_log "
+        "WHERE ticker = ? AND timeframe = ? AND ma_period = ? AND touch_date >= ? "
+        "ORDER BY touch_date ASC",
+        [ticker, timeframe, ma_period, since_date.isoformat()],
     )
     return [date.fromisoformat(r["touch_date"]) for r in rows]
 
@@ -644,13 +792,68 @@ def mark_warning_sent(ticker: str) -> None:
 # Alert log
 # ---------------------------------------------------------------------------
 
+def get_last_fired_bar_date(
+    ticker: str,
+    timeframe: str,
+    ma_period: int,
+    signal_type: str,
+) -> date | None:
+    """
+    Return the bar_date of the most recently fired alert for this signal key, or None.
+
+    Used by W/M detector gate: if the current completed bar's date is not newer
+    than the last-fired bar_date, the signal has already been dispatched for that
+    bar and must be suppressed.
+    """
+    rows = _db().execute(
+        "SELECT bar_date FROM alert_log "
+        "WHERE ticker = ? AND signal_type = ? AND timeframe = ? AND ma_period = ? "
+        "AND bar_date IS NOT NULL "
+        "ORDER BY bar_date DESC LIMIT 1",
+        [ticker, signal_type, timeframe, ma_period],
+    )
+    if rows and rows[0].get("bar_date"):
+        return date.fromisoformat(rows[0]["bar_date"])
+    return None
+
+
+def recent_alert_exists(
+    ticker: str,
+    ma_period: int | None,
+    timeframe: str | None,
+    signal_type: str,
+    days: int = 5,
+) -> bool:
+    """
+    Return True if a matching alert fired within the last `days` days.
+
+    Used by the dispatch cooldown gate to suppress duplicate alerts.
+    Matches on (ticker, signal_type, timeframe, ma_period) — all four columns.
+    NULL-safe: timeframe and ma_period are compared with IS so NULL rows match
+    correctly when the signal has no timeframe/period (e.g. HALT_WARNING).
+    """
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = _db().execute(
+        "SELECT id FROM alert_log "
+        "WHERE ticker = ? AND signal_type = ? "
+        "AND timeframe IS ? AND ma_period IS ? "
+        "AND fired_at >= ? LIMIT 1",
+        [ticker, signal_type, timeframe, ma_period, cutoff],
+    )
+    return bool(rows)
+
+
 def insert_alert(alert: dict) -> None:
     """Append-only insert into alert_log."""
+    bar_date_raw = alert.get("bar_date")
+    bar_date_str: str | None = (
+        bar_date_raw.isoformat() if isinstance(bar_date_raw, date) else bar_date_raw
+    )
     _db().execute(
         "INSERT INTO alert_log "
         "(ticker, signal_type, timeframe, ma_period, price_at_fire, ma_value, "
-        " volume_ratio, extra_json, fired_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " volume_ratio, extra_json, bar_date, fired_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             alert.get("ticker"),
             alert.get("signal_type"),
@@ -660,6 +863,7 @@ def insert_alert(alert: dict) -> None:
             alert.get("ma_value"),
             alert.get("volume_ratio"),
             json.dumps(alert.get("extra", {})),
+            bar_date_str,
             alert.get("fired_at", datetime.utcnow().isoformat() + "Z"),
         ],
     )

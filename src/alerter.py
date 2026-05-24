@@ -111,18 +111,32 @@ def _format_3b(alert: dict) -> str:
     """Format a 3B Reclaim Confirmed alert as MarkdownV2."""
     ticker = _escape_md2(alert["ticker"])
     period = alert["ma_period"]
+    tf = alert.get("timeframe", "D")
+    tf_label = _escape_md2(_tf_label(tf))
+    ma_label = _escape_md2(f"{tf}{period}")
     ma_val = _fmt_price(alert.get("ma_value"))
     extra = alert.get("extra", {})
     streak = extra.get("streak", 7)
     prev_step = extra.get("previous_step", "?")
     new_step = extra.get("new_step", "?")
 
+    # Daily: show cascade step change; W/M: omit (no de-escalation)
+    streak_unit = "days" if tf == "D" else "closes"
+    if tf == "D":
+        state_line = (
+            f"Previous state:      {_escape_md2(f'Step {prev_step}')} "
+            f"→ {_escape_md2(f'now Step {new_step}')}\n"
+        )
+    else:
+        state_line = ""
+
     return (
-        f"✅ {ticker} — {_escape_md2(f'D{period}')} {_escape_md2(label_for('3b'))}\n"
+        f"✅ {ticker} — {tf_label} {ma_label} {_escape_md2(label_for('3b'))}\n"
         f"\n"
-        f"MA reclaimed:     {_escape_md2(f'D{period}')} @ {ma_val}\n"
-        f"Consecutive days: {_escape_md2(f'{streak} closes above')}\n"
-        f"Previous state:   {_escape_md2(f'Step {prev_step}')} → {_escape_md2(f'now Step {new_step}')}\n"
+        f"MA reclaimed:        {ma_label} @ {ma_val}\n"
+        f"Consecutive {streak_unit}: {_escape_md2(f'{streak} closes above')}\n"
+        f"Timeframe:           {tf_label}\n"
+        f"{state_line}"
         f"\n"
         f"{_escape_md2('MA is now acting as support again.')}\n"
         f"\n"
@@ -279,10 +293,31 @@ def dispatch_alerts(alerts: list[dict]) -> int:
     Inserts successfully-sent alerts into alert_log.
     Failed sends are logged but do not abort the run.
 
+    Cooldown gate: skips any alert whose (ticker, signal_type, timeframe,
+    ma_period) combo already has a row in alert_log within the last
+    ALERT_COOLDOWN_DAYS days (default 5, overridable via env var).
+
     Returns the count of successfully sent messages.
     """
+    cooldown_days = int(os.getenv("ALERT_COOLDOWN_DAYS", "5"))
     sent = 0
     for alert in alerts:
+        ticker = alert.get("ticker", "")
+        signal_type = alert.get("signal_type", "")
+        timeframe = alert.get("timeframe")
+        ma_period = alert.get("ma_period")
+
+        if db.recent_alert_exists(ticker, ma_period, timeframe, signal_type, days=cooldown_days):
+            logger.info(
+                "Suppressed by cooldown (%dd): %s %s %s%s",
+                cooldown_days,
+                ticker,
+                signal_type,
+                timeframe or "",
+                ma_period or "",
+            )
+            continue
+
         try:
             message = format_alert(alert)
         except Exception as exc:
