@@ -596,12 +596,24 @@ def set_cascade_state(ticker: str, step: int, broken_ma: str) -> None:
 # Reclaim tracker
 # ---------------------------------------------------------------------------
 
-def get_reclaim_streak(ticker: str, timeframe: str, ma_period: int) -> int:
-    """Returns current consecutive-closes-above count for (ticker, timeframe, ma_period)."""
+def get_reclaim_streak(ticker: str, timeframe_or_period, ma_period: int | None = None) -> int:
+    """
+    Returns current consecutive-closes-above count for (ticker, timeframe, ma_period).
+
+    Backward-compatible: old 2-arg call (ticker, ma_period) still works — timeframe
+    defaults to 'D'. New 3-arg call (ticker, timeframe, ma_period) is preferred.
+    """
+    if isinstance(timeframe_or_period, int):
+        # Old call shape: get_reclaim_streak(ticker, ma_period)
+        timeframe = "D"
+        period = timeframe_or_period
+    else:
+        timeframe = timeframe_or_period
+        period = ma_period
     rows = _db().execute(
         "SELECT consecutive_closes FROM reclaim_tracker "
         "WHERE ticker = ? AND timeframe = ? AND ma_period = ?",
-        [ticker, timeframe, ma_period],
+        [ticker, timeframe, period],
     )
     return rows[0]["consecutive_closes"] if rows else 0
 
@@ -625,17 +637,32 @@ def get_reclaim_streak_full(ticker: str, timeframe: str, ma_period: int) -> dict
 
 def set_reclaim_streak(
     ticker: str,
-    timeframe: str,
-    ma_period: int,
-    streak: int,
-    streak_start: date | None = None,
+    timeframe_or_period,
+    ma_period_or_streak,
+    streak_or_start=None,
+    streak_start_or_sentinel=None,
     last_bar_date: date | None = None,
 ) -> None:
     """
     Upsert reclaim streak for this (ticker, timeframe, ma_period).
-    streak_start: the date the streak began; pass None when resetting streak to 0.
-    last_bar_date: the bar date last counted toward the streak (prevents double-counting).
+
+    Backward-compatible with old 4-arg call (ticker, ma_period, streak, streak_start).
+    New 5-arg call (ticker, timeframe, ma_period, streak, streak_start) is preferred.
+    last_bar_date is keyword-only and always optional.
     """
+    if isinstance(timeframe_or_period, int):
+        # Old call shape: set_reclaim_streak(ticker, ma_period, streak, streak_start)
+        timeframe = "D"
+        ma_period = timeframe_or_period
+        streak = ma_period_or_streak
+        streak_start = streak_or_start
+    else:
+        # New call shape: set_reclaim_streak(ticker, timeframe, ma_period, streak, streak_start)
+        timeframe = timeframe_or_period
+        ma_period = ma_period_or_streak
+        streak = streak_or_start
+        streak_start = streak_start_or_sentinel
+
     today = date.today().isoformat()
     start_str = streak_start.isoformat() if streak_start else None
     bar_str = last_bar_date.isoformat() if last_bar_date else None

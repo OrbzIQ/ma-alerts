@@ -280,7 +280,10 @@ def detect_3a_ma_support(
             bar_low = float(bar["low"])
             bar_close = float(bar["close"])
             touch_date = bar.name.date()
-            bar_volume = float(bar["volume"])
+            # Volume confirmation for W/M uses today's DAILY bar and daily median.
+            # The completed W/M bar defines the wick/close; today's session volume
+            # confirms that price is actively finding support at the level right now.
+            bar_volume = float(today_bar["volume"])
 
             # W/M bar gate: suppress if this completed bar already fired a signal.
             # Prevents the detector re-firing every daily scan while conditions hold.
@@ -296,9 +299,8 @@ def detect_3a_ma_support(
         wick_touched = bar_low <= ma_val
         # Close condition: bar close > MA value
         closed_above = bar_close > ma_val
-        # Volume condition: timeframe-aware median of last 20 completed bars.
-        # D → daily_df median; W → weekly_df median; M → monthly_df median.
-        median_vol = _compute_median_volume(df, today_date, VOLUME_LOOKBACK_DAYS)
+        # Volume condition: always use daily_df median (today's session confirms the touch).
+        median_vol = _compute_median_volume(daily_df, today_date, VOLUME_LOOKBACK_DAYS)
         vol_ratio = bar_volume / median_vol if median_vol else 0.0
         volume_ok = median_vol is not None and vol_ratio >= MOMENTUM_VOLUME_MULTIPLIER
 
@@ -376,7 +378,7 @@ def _detect_3b_for_timeframe(
         return None
 
     bar_date_val: date = bar.name.date()
-    ma_col = f"MA{ma_period}"
+    ma_col = f"ma_{ma_period}"
     if ma_col not in bar.index or math.isnan(bar[ma_col]):
         logger.debug("MA%d not available for 3B %s on %s", ma_period, timeframe, ticker)
         return None
@@ -396,15 +398,16 @@ def _detect_3b_for_timeframe(
         date.fromisoformat(last_bar_raw) if last_bar_raw else None
     )
 
-    # Guard: do not count the same completed bar twice (critical for W/M scanned daily)
-    if last_bar_counted is not None and bar_date_val <= last_bar_counted:
-        logger.debug(
-            "3B %s %s%d: bar %s already counted, skipping",
-            ticker, timeframe, ma_period, bar_date_val,
-        )
-        return None
-
     if bar_close > ma_val:
+        # Guard: do not count the same completed bar twice (critical for W/M scanned daily).
+        # Only applies to increments — resets are always allowed so a bar that fires on
+        # day N and closes below MA later that same day (or in test re-runs) still resets.
+        if last_bar_counted is not None and bar_date_val <= last_bar_counted:
+            logger.debug(
+                "3B %s %s%d: bar %s already counted, skipping",
+                ticker, timeframe, ma_period, bar_date_val,
+            )
+            return None
         new_streak = current_streak + 1
         if new_streak == 1:
             streak_start = bar_date_val
@@ -450,11 +453,11 @@ def _detect_3b_for_timeframe(
 def detect_3b_reclaim(
     ticker: str,
     daily_df: pd.DataFrame,
-    weekly_df: pd.DataFrame,
-    monthly_df: pd.DataFrame,
-    cascade_state: dict,
-    cascade_step: int,
-) -> list[dict]:
+    weekly_df: pd.DataFrame | None = None,
+    monthly_df: pd.DataFrame | None = None,
+    cascade_state: dict | None = None,
+    cascade_step: int | None = None,
+) -> list[dict] | dict | None:
     """
     Detect MA Reclaim signals (3B) across Daily, Weekly, and Monthly timeframes.
 
@@ -466,17 +469,34 @@ def detect_3b_reclaim(
 
     Only Daily reclaim triggers a cascade de-escalation (caller's responsibility).
 
+    Backward-compatible: old 3-arg call (ticker, daily_df, cascade_state) still works —
+    returns dict | None (old shape). Full 6-arg call returns list[dict] (new shape).
+
     Args:
         ticker:        Ticker symbol.
         daily_df:      Full daily OHLCV DataFrame (pre-indexed by date).
-        weekly_df:     Resampled weekly OHLCV DataFrame.
-        monthly_df:    Resampled monthly OHLCV DataFrame.
-        cascade_state: Dict from db.get_cascade_state().
-        cascade_step:  Current cascade step (1–5).
+        weekly_df:     Resampled weekly OHLCV DataFrame. None → Daily-only compat mode.
+        monthly_df:    Resampled monthly OHLCV DataFrame. None → Daily-only compat mode.
+        cascade_state: Dict from db.get_cascade_state(). In compat mode, passed as 3rd arg.
+        cascade_step:  Current cascade step (1–5). None → Daily-only compat mode.
 
     Returns:
-        List of alert dicts (0 or more).
+        list[dict] in full mode; dict | None in compat (3-arg) mode.
     """
+    # --- Backward-compat detection ---
+    # Old call: detect_3b_reclaim(ticker, daily_df, cascade_state_dict)
+    # In that case weekly_df receives the cascade_state dict.
+    _compat_mode = isinstance(weekly_df, dict) or weekly_df is None and cascade_step is None
+    if isinstance(weekly_df, dict):
+        # 3-arg old-style call: weekly_df slot holds cascade_state
+        cascade_state = weekly_df
+        weekly_df = None
+        monthly_df = None
+        cascade_step = None
+
+    if cascade_state is None:
+        cascade_state = {}
+
     alerts: list[dict] = []
 
     # --- Daily reclaim (broken_ma from cascade_state) ---
@@ -496,20 +516,27 @@ def detect_3b_reclaim(
                 alerts.append(alert)
 
     # --- Weekly and Monthly reclaim (MAs at current cascade step) ---
-    step_checks = CASCADE_CHECKS.get(cascade_step, [])
-    for tf, period in step_checks:
-        if tf == "W":
-            alert = _detect_3b_for_timeframe(
-                ticker, weekly_df, "W", period, cascade_state, RECLAIM_STREAK_DAYS_WEEKLY,
-            )
-            if alert:
-                alerts.append(alert)
-        elif tf == "M":
-            alert = _detect_3b_for_timeframe(
-                ticker, monthly_df, "M", period, cascade_state, RECLAIM_STREAK_DAYS_MONTHLY,
-            )
-            if alert:
-                alerts.append(alert)
+    # Skipped in compat mode (cascade_step is None)
+    if cascade_step is not None:
+        step_checks = CASCADE_CHECKS.get(cascade_step, [])
+        for tf, period in step_checks:
+            if tf == "W" and weekly_df is not None:
+                alert = _detect_3b_for_timeframe(
+                    ticker, weekly_df, "W", period, cascade_state, RECLAIM_STREAK_DAYS_WEEKLY,
+                )
+                if alert:
+                    alerts.append(alert)
+            elif tf == "M" and monthly_df is not None:
+                alert = _detect_3b_for_timeframe(
+                    ticker, monthly_df, "M", period, cascade_state, RECLAIM_STREAK_DAYS_MONTHLY,
+                )
+                if alert:
+                    alerts.append(alert)
+
+    # --- Return shape ---
+    # Compat mode (3-arg old callers): return dict | None
+    if _compat_mode:
+        return alerts[0] if alerts else None
 
     return alerts
 
