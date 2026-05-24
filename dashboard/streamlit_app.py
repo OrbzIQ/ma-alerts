@@ -115,9 +115,9 @@ BROKEN_MA_BY_STEP: dict[int, str] = {
 
 # UI label → DB value mapping for signal_type filter
 SIGNAL_LABEL_TO_DB: dict[str, str] = {
-    "3A": "MA_SUPPORT",
-    "3B": "RECLAIM",
-    "3C": "TOUCH_ACCUMULATION",
+    "SUPPORT": "MA_SUPPORT",
+    "BREAKTHROUGH": "RECLAIM",
+    "ACCUMULATION": "TOUCH_ACCUMULATION",
     "3D": "3D",
 }
 DB_TO_SIGNAL_LABEL: dict[str, str] = {v: k for k, v in SIGNAL_LABEL_TO_DB.items()}
@@ -150,13 +150,12 @@ ALERT_MARKER_COLORS: dict[str, str] = {
 
 @st.cache_data(ttl=300)
 def load_watchlist() -> pd.DataFrame:
-    """Load from watchlist.yml via _PROJECT_ROOT. NOT from a DB table (FIX-4)."""
-    path = os.path.join(_PROJECT_ROOT, "watchlist.yml")
+    """Load from watchlist.yaml via _PROJECT_ROOT. NOT from a DB table (FIX-4)."""
+    path = os.path.join(_PROJECT_ROOT, "watchlist.yaml")
     with open(path) as f:
-        data = yaml.safe_load(f)
-    return pd.DataFrame(
-        [{"ticker": t["ticker"], "market": t.get("market", "US")} for t in data["tickers"]]
-    )
+        data = yaml.safe_load(f) or {}
+    us = data.get("us") or []
+    return pd.DataFrame([{"ticker": t, "market": "US"} for t in us])
 
 
 @st.cache_data(ttl=3600)
@@ -229,7 +228,7 @@ def load_overview() -> pd.DataFrame:
 @st.cache_data(ttl=300)
 def load_alert_log(
     tickers: tuple,       # UI ticker strings — already DB values
-    signal_types: tuple,  # UI labels e.g. ("3A", "3D")
+    signal_types: tuple,  # UI labels e.g. ("SUPPORT", "3D")
     timeframes: tuple,    # UI labels e.g. ("Daily",)
     date_from: date,
     date_to: date,
@@ -306,6 +305,83 @@ def load_data_health() -> pd.DataFrame:
         "FROM data_health"
     )
     return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def load_signal_history() -> pd.DataFrame:
+    """Last 30 days of alerts with alert-date close and most-recent close from ohlcv."""
+    cutoff = (date.today() - timedelta(days=30)).isoformat()
+    rows = run_query(
+        """
+        SELECT
+            al.fired_at,
+            al.ticker,
+            al.signal_type,
+            al.ma_period,
+            al.timeframe,
+            ohlcv_alert.close  AS alert_close,
+            (SELECT close FROM ohlcv
+             WHERE ticker = al.ticker
+             ORDER BY date DESC LIMIT 1) AS current_close
+        FROM alert_log al
+        LEFT JOIN ohlcv ohlcv_alert
+            ON  ohlcv_alert.ticker = al.ticker
+            AND ohlcv_alert.date   = substr(al.fired_at, 1, 10)
+        WHERE al.fired_at >= ?
+        ORDER BY al.fired_at DESC
+        """,
+        [cutoff],
+    )
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    df["Date"] = df["fired_at"].apply(lambda s: str(s)[:10] if s else "—")
+
+    df["Signal"] = df["signal_type"].map(
+        lambda s: DB_TO_SIGNAL_LABEL.get(str(s), str(s)) if pd.notna(s) and s else "—"
+    )
+
+    df["MA"] = df.apply(
+        lambda r: f"{r['timeframe']}{int(r['ma_period'])}"
+        if pd.notna(r.get("timeframe")) and pd.notna(r.get("ma_period"))
+        else "—",
+        axis=1,
+    )
+
+    _tf_display = {"D": "Daily", "W": "Weekly", "M": "Monthly"}
+    df["Timeframe"] = df["timeframe"].map(
+        lambda t: _tf_display.get(str(t), str(t)) if pd.notna(t) else "—"
+    )
+
+    df["Alert Price"] = df["alert_close"].apply(
+        lambda v: f"${float(v):.2f}" if pd.notna(v) and v is not None else "—"
+    )
+
+    df["Current Price"] = df["current_close"].apply(
+        lambda v: f"${float(v):.2f}" if pd.notna(v) and v is not None else "—"
+    )
+
+    def _pct_change(row) -> str:
+        a = row.get("alert_close")
+        c = row.get("current_close")
+        try:
+            af, cf = float(a), float(c)
+            if af == 0:
+                return "—"
+            pct = (cf - af) / af * 100
+            sign = "+" if pct >= 0 else ""
+            return f"{sign}{pct:.1f}%"
+        except (TypeError, ValueError):
+            return "—"
+
+    df["% Change Since Alert"] = df.apply(_pct_change, axis=1)
+
+    return df[
+        ["Date", "ticker", "Signal", "MA", "Timeframe",
+         "Alert Price", "Current Price", "% Change Since Alert"]
+    ].rename(columns={"ticker": "Ticker"})
 
 
 @st.cache_data(ttl=300)
@@ -543,6 +619,19 @@ def render_data_health() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tab: Signal History
+# ---------------------------------------------------------------------------
+
+def render_signal_history() -> None:
+    df = load_signal_history()
+    if df.empty:
+        st.info("No alerts in the last 30 days.")
+        return
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.caption(f"{len(df)} alert(s) in the last 30 days")
+
+
+# ---------------------------------------------------------------------------
 # Main — password gate FIRST, tabs only after authed (spec §B.6)
 # NO auto-refresh checkbox (spec §B.6 — cache TTL handles freshness)
 # ---------------------------------------------------------------------------
@@ -556,7 +645,7 @@ def main() -> None:
 
     st.caption(load_last_scan_timestamp())
 
-    tabs = st.tabs(["Overview", "Alert Log", "Per-Ticker Chart", "Data Health"])
+    tabs = st.tabs(["Overview", "Alert Log", "Per-Ticker Chart", "Data Health", "Signal History"])
     with tabs[0]:
         render_overview()
     with tabs[1]:
@@ -565,6 +654,8 @@ def main() -> None:
         render_per_ticker()
     with tabs[3]:
         render_data_health()
+    with tabs[4]:
+        render_signal_history()
 
 
 if __name__ == "__main__":
