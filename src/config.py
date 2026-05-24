@@ -5,6 +5,9 @@ Do not import from other src modules here. This module must have zero
 dependencies on the rest of the package so it can be imported anywhere safely.
 """
 
+import yaml
+from pathlib import Path
+
 # ---------------------------------------------------------------------------
 # Moving Average periods
 # ---------------------------------------------------------------------------
@@ -52,3 +55,24 @@ BOOTSTRAP_MAX_CANDLES: int = 5000      # outputsize passed to Twelve Data — fe
 OHLCV_RETENTION_YEARS: int = 5         # OHLCV rows older than this are pruned
 HALT_FAILURE_THRESHOLD: int = 3        # Send Telegram warning after N consecutive fetch failures
 HALT_WARNING_RESEND_DAYS: int = 7      # Minimum days between repeated halt warnings per ticker
+
+
+# ---------------------------------------------------------------------------
+# Watchlist
+# ---------------------------------------------------------------------------
+
+def _repo_root() -> Path:
+    """Walk upward from this file until we find the repo root (.git or pyproject.toml)."""
+    for p in [Path(__file__).resolve(), *Path(__file__).resolve().parents]:
+        if (p / "pyproject.toml").exists() or (p / ".git").exists():
+            return p
+    raise RuntimeError("repo root not found")
+
+
+def load_watchlist() -> list[str]:
+    """Load US watchlist from watchlist.yaml at repo root.
+
+    Returns a flat list of US ticker symbols (e.g. ['AAPL', 'MSFT', ...]).
+    """
+    data = yaml.safe_load((_repo_root() / "watchlist.yaml").read_text()) or {}
+    return list(data.get("us") or [])

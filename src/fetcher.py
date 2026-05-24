@@ -3,7 +3,6 @@ fetcher.py -- Twelve Data Daily OHLCV client.
 
 Symbol conventions:
   - US tickers: passed as-is (e.g. 'GOOG', 'AAPL')
-  - SG tickers: append ':SES' suffix (e.g. 'D05' -> 'D05:SES')
 
 Rate limiting:
   - Free tier: 8 calls/minute. Hard minimum 8s between calls -> max 7.5 calls/min.
@@ -62,9 +61,7 @@ def _api_key() -> str:
 
 
 def _map_symbol(ticker: str, market: str) -> str:
-    """Apply Twelve Data symbol convention for each market."""
-    if market == "SG":
-        return ticker + ":SES"
+    """Return the Twelve Data symbol for a ticker. US tickers are passed as-is."""
     return ticker
 
 
