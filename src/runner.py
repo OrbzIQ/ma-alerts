@@ -78,6 +78,25 @@ def _check_env() -> None:
         )
 
 
+def _fail_and_alert(reason: str) -> int:
+    """
+    Send an ops alert for a pre-flight failure and return exit code 1.
+
+    Lazy-imports send_ops_message so this is safe to call before the
+    main() import block runs (e.g. from the env-check path).
+    Never raises — if alert dispatch itself fails, the error is logged
+    and the function still returns 1.
+    """
+    _ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    msg = f"scanner pre-flight failed: {reason}\nUTC: {_ts}"
+    try:
+        from src.alerter import send_ops_message
+        send_ops_message(msg)
+    except Exception as alert_exc:
+        logger.error("Failed to dispatch pre-flight ops alert: %r", alert_exc)
+    return 1
+
+
 # ---------------------------------------------------------------------------
 # Watchlist loading
 # ---------------------------------------------------------------------------
@@ -287,7 +306,7 @@ def main(market: str) -> int:
             _check_env()
         except RuntimeError as exc:
             logger.critical("%s", exc)
-            return 1
+            return _fail_and_alert(str(exc))
 
         import src.db as db
         from src.alerter import dispatch_alerts, send_ops_message
@@ -299,14 +318,14 @@ def main(market: str) -> int:
             db.init_schema()
         except Exception as exc:
             logger.critical("Schema init failed: %s", exc)
-            return 1
+            return _fail_and_alert(f"schema init failed: {exc}")
 
         # 3. Load watchlist
         try:
             watchlist = _load_watchlist_from_yaml(market)
         except Exception as exc:
             logger.critical("Watchlist load failed: %s", exc)
-            return 1
+            return _fail_and_alert(f"watchlist load failed: {exc}")
 
         if not watchlist:
             logger.warning("Watchlist is empty for market=%s — nothing to scan", market)
@@ -370,7 +389,7 @@ def main(market: str) -> int:
     except Exception as exc:
         _ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         _msg = (
-            f"Run FAILED — market={market}\n"
+            f"scanner failed mid-run — market={market}\n"
             f"Tickers attempted: {_tickers_processed}/{_watchlist_size}\n"
             f"Type: {type(exc).__name__}\n"
             f"Detail: {repr(exc)[:200]}\n"
