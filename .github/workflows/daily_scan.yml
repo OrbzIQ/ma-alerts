@@ -4,8 +4,6 @@ on:
   schedule:
     # US close: 22:30 UTC (1.5h after 16:00 EST in winter, 2.5h after 16:00 EDT in summer)
     - cron: '30 22 * * 1-5'
-    # SG close: 10:30 UTC (~1.5h after 17:00 SGT close, no DST)
-    - cron: '30 10 * * 1-5'
   workflow_dispatch:
     inputs:
       market:
@@ -42,17 +40,10 @@ jobs:
       - name: Determine market from cron
         id: detect-market
         run: |
-          # If manually triggered, use the input; otherwise infer from cron schedule
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "market=${{ github.event.inputs.market }}" >> $GITHUB_OUTPUT
           else
-            # Cron-triggered. Use the hour to pick market.
-            HOUR=$(date -u +%H)
-            if [ "$HOUR" = "22" ]; then
-              echo "market=US" >> $GITHUB_OUTPUT
-            else
-              echo "market=SG" >> $GITHUB_OUTPUT
-            fi
+            echo "market=US" >> $GITHUB_OUTPUT
           fi
 
       - name: Run scan
