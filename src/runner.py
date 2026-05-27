@@ -329,6 +329,10 @@ def main(market: str) -> int:
 
         if not watchlist:
             logger.warning("Watchlist is empty for market=%s — nothing to scan", market)
+            send_ops_message(
+                "[OPS] scanner completed but watchlist empty — "
+                "zero tickers processed"
+            )
             return 0
 
         _watchlist_size = len(watchlist)
