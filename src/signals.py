@@ -325,6 +325,7 @@ def detect_3a_ma_support(
             "touch_count": touch_count,
             "next_resistance_ma": next_res[0] if next_res else None,
             "next_resistance_value": next_res[1] if next_res else None,
+            "bar_low": bar_low,
         }
 
         alert = build_alert(
@@ -359,6 +360,24 @@ def _detect_3b_for_timeframe(
     """
     Core reclaim logic for a single (timeframe, ma_period) combination.
 
+    Break-gated, single-fire semantics:
+      - A close at or below the MA is always a "break": streak resets to 0, and
+        for W/M timeframes was_broken is set to 1 (arms the reclaim gate).
+      - For W/M, a close above the MA only increments the streak if was_broken
+        is already 1 — i.e. price must have actually lost this MA as support
+        at some point since the last reset before a reclaim can be counted.
+        Without a prior break there is nothing to "reclaim", so the close is a
+        no-op (no increment, no fire).
+      - For Daily, a close above the MA always increments (Daily's required
+        streak is preceded by cascade_state.broken_ma already being set, which
+        establishes the break precondition upstream).
+      - Fire is exact (new_streak == required_streak), not >=, so a row that
+        drifts past the threshold cannot re-fire.
+      - Immediately after building the alert, the tracker row is fully reset
+        (streak=0, streak_start=None, was_broken=0) so the next close starts a
+        fresh streak instead of continuing to climb past required_streak and
+        instant-refiring.
+
     For W/M timeframes, each completed bar is counted at most once (guarded by
     last_bar_date in reclaim_tracker). For Daily, every calendar day of scan is
     a new bar so the guard is not needed but is harmless.
@@ -390,6 +409,7 @@ def _detect_3b_for_timeframe(
     current_streak: int = tracker["consecutive_closes"]
     streak_start_raw = tracker["streak_start"]
     last_bar_raw = tracker.get("last_bar_date")
+    was_broken: int = tracker.get("was_broken") or 0
 
     streak_start: date | None = (
         date.fromisoformat(streak_start_raw) if streak_start_raw else None
@@ -408,15 +428,26 @@ def _detect_3b_for_timeframe(
                 ticker, timeframe, ma_period, bar_date_val,
             )
             return None
+
+        if timeframe in ("W", "M") and not was_broken:
+            # No prior break since the last reset — nothing to reclaim. No-op:
+            # do not increment, do not fire. Still record last_bar_date so this
+            # bar isn't re-evaluated on a later scan.
+            logger.debug(
+                "3B %s %s%d: close above MA but no prior break — no-op",
+                ticker, timeframe, ma_period,
+            )
+            db.set_reclaim_streak(
+                ticker, timeframe, ma_period, current_streak, streak_start,
+                last_bar_date=bar_date_val, was_broken=was_broken,
+            )
+            return None
+
         new_streak = current_streak + 1
         if new_streak == 1:
             streak_start = bar_date_val
-        db.set_reclaim_streak(
-            ticker, timeframe, ma_period, new_streak, streak_start,
-            last_bar_date=bar_date_val,
-        )
 
-        if new_streak >= required_streak:
+        if new_streak == required_streak:
             current_step = cascade_state.get("current_step", 1)
             alert = build_alert(
                 ticker=ticker,
@@ -437,14 +468,27 @@ def _detect_3b_for_timeframe(
                 "%s confirmed for %s %s%d — streak=%d",
                 label_for("3b"), ticker, timeframe, ma_period, new_streak,
             )
+            # Post-fire reset: prevents the row from continuing to climb past
+            # required_streak and instant-refiring on the next qualifying close.
+            db.set_reclaim_streak(
+                ticker, timeframe, ma_period, 0, None,
+                last_bar_date=bar_date_val, was_broken=0,
+            )
             return alert
+
+        db.set_reclaim_streak(
+            ticker, timeframe, ma_period, new_streak, streak_start,
+            last_bar_date=bar_date_val, was_broken=was_broken,
+        )
     else:
-        # Close at or below MA — reset streak
+        # Close at or below MA — reset streak. For W/M, this is the break that
+        # arms the reclaim gate (was_broken=1) for the next above-MA close.
         if current_streak > 0:
             logger.debug("3B streak reset for %s %s%d", ticker, timeframe, ma_period)
+        new_was_broken = 1 if timeframe in ("W", "M") else 0
         db.set_reclaim_streak(
             ticker, timeframe, ma_period, 0, None,
-            last_bar_date=bar_date_val,
+            last_bar_date=bar_date_val, was_broken=new_was_broken,
         )
 
     return None
@@ -763,4 +807,3 @@ def detect_3d(
         ticker, today_close, volume_ratio, d20, d50, d100, d150, d200,
     )
     return alert
-

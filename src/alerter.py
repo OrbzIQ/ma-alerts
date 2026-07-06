@@ -61,6 +61,15 @@ def _tf_label(tf: str) -> str:
     return {"D": "Daily", "W": "Weekly", "M": "Monthly"}.get(tf, tf)
 
 
+def _fmt_bar_date(bar_date) -> str:
+    """Format an alert's bar_date as MarkdownV2, or 'N/A' if None."""
+    if bar_date is None:
+        return _escape_md2("N/A")
+    if isinstance(bar_date, str):
+        return _escape_md2(bar_date)
+    return _escape_md2(bar_date.isoformat())
+
+
 # ---------------------------------------------------------------------------
 # Message formatting
 # ---------------------------------------------------------------------------
@@ -81,7 +90,8 @@ def _format_3a(alert: dict) -> str:
     extra = alert.get("extra", {})
     touch_count = extra.get("touch_count", 1)
     touch_str = _escape_md2(f"{touch_count} of 3 (within 15\\-day window)")
-    wick_low = _fmt_price(alert.get("ma_value"))   # wick touched near MA
+    wick_low = _fmt_price(extra.get("bar_low"))   # actual bar low that touched the MA
+    bar_date_str = _fmt_bar_date(alert.get("bar_date"))
 
     next_res_ma = extra.get("next_resistance_ma")
     next_res_val = extra.get("next_resistance_value")
@@ -99,6 +109,7 @@ def _format_3a(alert: dict) -> str:
         f"Timeframe:    {tf_label}\n"
         f"Signal Type:  {_escape_md2(label_for('3a'))}\n"
         f"Touch count:  {_escape_md2(f'{touch_count} of 3 (within 15-day window)')}\n"
+        f"Bar date:     {bar_date_str}\n"
         f"\n"
         f"Wick low touched {wick_low}, closed at {price}\n"
         f"Next resistance: {next_res_str}\n"
@@ -114,7 +125,9 @@ def _format_3b(alert: dict) -> str:
     tf = alert.get("timeframe", "D")
     tf_label = _escape_md2(_tf_label(tf))
     ma_label = _escape_md2(f"{tf}{period}")
-    ma_val = _fmt_price(alert.get("ma_value"))
+    ma_value = alert.get("ma_value")
+    ma_val = _fmt_price(ma_value)
+    bar_date_str = _fmt_bar_date(alert.get("bar_date"))
     extra = alert.get("extra", {})
     streak = extra.get("streak", 7)
     prev_step = extra.get("previous_step", "?")
@@ -130,12 +143,24 @@ def _format_3b(alert: dict) -> str:
     else:
         state_line = ""
 
+    price = alert.get("price")
+    if price is not None and ma_value:
+        # Describes where the MA sits relative to price, e.g. "22.1% below price"
+        # (MA below price is the normal case for a reclaim — price closed above it).
+        pct = (price - ma_value) / ma_value * 100.0
+        direction = "below" if pct >= 0 else "above"
+        ma_vs_price_str = _escape_md2(f"{abs(pct):.1f}% {direction} price")
+    else:
+        ma_vs_price_str = _escape_md2("N/A")
+
     return (
         f"✅ {ticker} — {tf_label} {ma_label} {_escape_md2(label_for('3b'))}\n"
         f"\n"
         f"MA reclaimed:        {ma_label} @ {ma_val}\n"
         f"Consecutive {streak_unit}: {_escape_md2(f'{streak} closes above')}\n"
         f"Timeframe:           {tf_label}\n"
+        f"Bar date:            {bar_date_str}\n"
+        f"MA vs price:         {ma_vs_price_str}\n"
         f"{state_line}"
         f"\n"
         f"{_escape_md2('MA is now acting as support again.')}\n"
@@ -165,6 +190,7 @@ def _format_3c(alert: dict) -> str:
         except ValueError:
             formatted_dates.append(ds)
     dates_str = _escape_md2(" · ".join(formatted_dates) if formatted_dates else "N/A")
+    bar_date_str = _fmt_bar_date(alert.get("bar_date"))
 
     return (
         f"🔁 {ticker} — {tf_label} {ma_label} {_escape_md2(label_for('3c'))}\n"
@@ -172,6 +198,7 @@ def _format_3c(alert: dict) -> str:
         f"Touch count:  {_escape_md2(f'{touch_count} of 3 within 15 days')}\n"
         f"MA Value:     {ma_val}\n"
         f"Dates:        {dates_str}\n"
+        f"Bar date:     {bar_date_str}\n"
         f"\n"
         f"{_escape_md2('Level is repeatedly holding as support. Potential bottom forming.')}\n"
         f"\n"
@@ -193,6 +220,7 @@ def _format_3d(alert: dict) -> str:
     vol_str    = _escape_md2(f"{vol_ratio:.1f}× avg")
 
     stack_str  = _escape_md2("D20 > D50 > D100 > D150 > D200 ✓")
+    bar_date_str = _fmt_bar_date(alert.get("bar_date"))
 
     return (
         f"🚀 {ticker} — {_escape_md2('D20 Momentum Touch')}\n"
@@ -201,6 +229,7 @@ def _format_3d(alert: dict) -> str:
         f"D20 MA:       {d20}\n"
         f"Volume:       {vol_str}\n"
         f"MA stack:     {stack_str}\n"
+        f"Bar date:     {bar_date_str}\n"
         f"\n"
         f"Wick low touched {wick_low}, closed at {close_val}\n"
         f"\n"
