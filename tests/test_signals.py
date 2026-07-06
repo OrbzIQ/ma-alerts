@@ -240,6 +240,126 @@ class TestDetect3BReclaim:
         r2 = self._run(df, state)
         assert r2 is not None
 
+    def test_daily_row_fully_reset_after_fire(self):
+        # V's latent 7->8 instant-refire bug: after firing at streak 7, the
+        # tracker row must be fully reset (streak=0, was_broken=0), not left
+        # sitting at streak=7 ready to climb to 8 and refire.
+        import src.db as db
+        df = _make_daily_df(n=60, base_close=210.0)
+        _add_mas(df, (50,))
+        ma_val = float(df["ma_50"].iloc[-1])
+        db.set_reclaim_streak("TEST", 50, 6, date.today() - timedelta(days=6))
+        df.iloc[-1, df.columns.get_loc("close")] = ma_val + 2.0
+        result = self._run(df, _cascade_state())
+        assert result is not None
+        assert result["extra"]["streak"] == 7
+        row = db.get_reclaim_streak_full("TEST", "D", 50)
+        assert row["consecutive_closes"] == 0
+        assert row["streak_start"] is None
+        assert row["was_broken"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Signal 3B -- MA Reclaim: break-gated W/M semantics (Fix 1 / F1+F2)
+# ---------------------------------------------------------------------------
+
+class TestDetect3BWeeklyMonthlyBreakGate:
+    """
+    Exercises _detect_3b_for_timeframe directly for W/M timeframes, which are
+    break-gated: a reclaim can only be counted/fired if price has actually
+    closed at or below the MA (a real break) since the streak was last reset.
+    """
+
+    def _bar_df(self, end_date, ma_period=50, ma_value=200.0, close=None, n=60):
+        """
+        Build a daily-indexed df (used to stand in for a W/M bar series) whose
+        last bar is dated end_date with the given close, and whose ma_{period}
+        is pinned to ma_value on every row (flat MA keeps the test's intent —
+        "close vs MA" — unambiguous regardless of lookback window effects).
+        """
+        dates = pd.bdate_range(end=end_date, periods=n)
+        closes = [ma_value] * n
+        if close is not None:
+            closes[-1] = close
+        df = pd.DataFrame(
+            {
+                "open":   [c - 1.0 for c in closes],
+                "high":   [c + 2.0 for c in closes],
+                "low":    [c - 2.0 for c in closes],
+                "close":  closes,
+                "volume": [1_000_000] * n,
+            },
+            index=dates,
+        )
+        df[f"ma_{ma_period}"] = ma_value
+        return df
+
+    def _detect(self, df, ma_period=50, required_streak=2, cascade_state=None):
+        from src.signals import _detect_3b_for_timeframe
+        return _detect_3b_for_timeframe(
+            "TEST", df, "W", ma_period, cascade_state or _cascade_state(), required_streak,
+        )
+
+    def test_wm_never_fires_without_prior_break(self):
+        # LITE M50 bug: price closes above a MA that was never broken. Streak
+        # must never increment and a reclaim must never fire.
+        import src.db as db
+        for end_date in ("2026-05-04", "2026-05-11", "2026-05-18", "2026-05-25"):
+            df = self._bar_df(end_date, ma_value=200.0, close=250.0)
+            result = self._detect(df)
+            assert result is None
+        row = db.get_reclaim_streak_full("TEST", "W", 50)
+        assert row["consecutive_closes"] == 0
+
+    def test_wm_break_then_fires_exactly_once_at_n(self):
+        import src.db as db
+        # Bar 1: break (close <= MA) — arms was_broken, resets streak.
+        df1 = self._bar_df("2026-05-04", ma_value=200.0, close=195.0)
+        assert self._detect(df1) is None
+        row = db.get_reclaim_streak_full("TEST", "W", 50)
+        assert row["was_broken"] == 1
+        assert row["consecutive_closes"] == 0
+
+        # Bar 2: close above MA -> streak 1 (required_streak=2, no fire yet).
+        df2 = self._bar_df("2026-05-11", ma_value=200.0, close=205.0)
+        assert self._detect(df2) is None
+        row = db.get_reclaim_streak_full("TEST", "W", 50)
+        assert row["consecutive_closes"] == 1
+
+        # Bar 3: close above MA again -> streak reaches required_streak (2) -> fires.
+        df3 = self._bar_df("2026-05-18", ma_value=200.0, close=206.0)
+        result = self._detect(df3)
+        assert result is not None
+        assert result["signal_type"] == "RECLAIM"
+        assert result["extra"]["streak"] == 2
+
+    def test_no_refire_post_confirmation_without_fresh_break(self):
+        import src.db as db
+        df1 = self._bar_df("2026-05-04", ma_value=200.0, close=195.0)
+        self._detect(df1)
+        df2 = self._bar_df("2026-05-11", ma_value=200.0, close=205.0)
+        self._detect(df2)
+        df3 = self._bar_df("2026-05-18", ma_value=200.0, close=206.0)
+        result = self._detect(df3)
+        assert result is not None  # confirmed at streak 2
+
+        # Row must be fully reset post-fire.
+        row = db.get_reclaim_streak_full("TEST", "W", 50)
+        assert row["consecutive_closes"] == 0
+        assert row["was_broken"] == 0
+
+        # Further closes above MA with no fresh break must NOT refire or
+        # increment — was_broken is 0 again after the post-fire reset.
+        df4 = self._bar_df("2026-05-25", ma_value=200.0, close=207.0)
+        result2 = self._detect(df4)
+        assert result2 is None
+        row2 = db.get_reclaim_streak_full("TEST", "W", 50)
+        assert row2["consecutive_closes"] == 0
+
+        df5 = self._bar_df("2026-06-01", ma_value=200.0, close=208.0)
+        result3 = self._detect(df5)
+        assert result3 is None
+
 
 # ---------------------------------------------------------------------------
 # Signal 3C -- Touch Accumulation

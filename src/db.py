@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS reclaim_tracker (
     consecutive_closes  INTEGER NOT NULL DEFAULT 0,
     streak_start        DATE,
     last_bar_date       TEXT,                        -- most recently counted bar date (idempotency)
+    was_broken          INTEGER NOT NULL DEFAULT 0,   -- 1 = price has closed <= MA since last reset
     last_updated        DATE NOT NULL,
     PRIMARY KEY (ticker, timeframe, ma_period),
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
@@ -498,6 +499,59 @@ def _migrate_reclaim_tracker_v2() -> None:
         logger.error("reclaim_tracker V2 migration failed: %s", exc)
 
 
+def _migrate_reclaim_tracker_v3() -> None:
+    """
+    V3 migration: add was_broken INTEGER column to reclaim_tracker, and zero out
+    streak state that predates the break-gated single-fire fix.
+
+    was_broken tracks whether price has closed AT OR BELOW the MA since the
+    streak was last reset — W/M reclaim increments are only counted when
+    was_broken == 1, so a reclaim cannot fire without a prior confirmed break.
+
+    On rollout, existing streak state was accumulated under the old (ungated,
+    >=-threshold, no-post-fire-reset) logic and cannot be trusted:
+      - All W/M streaks are zeroed (they may have counted un-broken closes).
+      - Daily streaks >= 7 are zeroed (rows left in a fired-but-not-reset state
+        by the old logic, which would otherwise instant-refire on the next
+        qualifying close).
+
+    Idempotent: checks sqlite_master for the was_broken column first.
+    """
+    try:
+        rows = _db().execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='reclaim_tracker'"
+        )
+    except Exception as exc:
+        logger.warning("reclaim_tracker V3 migration: sqlite_master read failed (%s) — skipping", exc)
+        return
+
+    if not rows:
+        return  # table doesn't exist yet; fresh _SCHEMA_SQL DDL creates it with was_broken
+
+    table_sql: str = (rows[0].get("sql") or "")
+    if "was_broken" in table_sql:
+        return  # already migrated
+
+    try:
+        _db().execute(
+            "ALTER TABLE reclaim_tracker ADD COLUMN was_broken INTEGER NOT NULL DEFAULT 0"
+        )
+        _db().execute(
+            "UPDATE reclaim_tracker SET consecutive_closes=0, streak_start=NULL "
+            "WHERE timeframe IN ('W','M')"
+        )
+        _db().execute(
+            "UPDATE reclaim_tracker SET consecutive_closes=0, streak_start=NULL "
+            "WHERE timeframe='D' AND consecutive_closes >= 7"
+        )
+        logger.info(
+            "reclaim_tracker V3 migration complete — was_broken added, "
+            "W/M streaks zeroed, fired D streaks (>=7) zeroed"
+        )
+    except Exception as exc:
+        logger.error("reclaim_tracker V3 migration failed: %s", exc)
+
+
 def _migrate_api_usage_v1() -> None:
     """
     B3 migration: ensure api_usage table exists on DBs created before B3.
@@ -539,6 +593,7 @@ def init_schema() -> None:
     _migrate_alert_log_v2()
     _migrate_alert_log_v3()
     _migrate_reclaim_tracker_v2()
+    _migrate_reclaim_tracker_v3()
     _migrate_api_usage_v1()
     logger.info("Schema initialised (or already up to date)")
 
@@ -564,10 +619,16 @@ def upsert_ohlcv(ticker: str, candles: list[dict]) -> None:
 
 
 def get_ohlcv(ticker: str, days: int) -> pd.DataFrame:
-    """Return last N days of Daily OHLCV for ticker as a DataFrame indexed by date."""
+    """Return last N days of Daily OHLCV for ticker as a DataFrame indexed by date.
+
+    The inner query orders DESC so LIMIT keeps the N MOST RECENT rows (ORDER BY
+    date ASC LIMIT N would instead return the N OLDEST rows — the bug this fixes).
+    The DataFrame is then re-sorted ascending via set_index().sort_index() below,
+    so the returned shape/order is unchanged for callers.
+    """
     rows = _db().execute(
         "SELECT date, open, high, low, close, volume FROM ohlcv "
-        "WHERE ticker = ? ORDER BY date ASC LIMIT ?",
+        "WHERE ticker = ? ORDER BY date DESC LIMIT ?",
         [ticker, days],
     )
     if not rows:
@@ -660,7 +721,7 @@ def get_reclaim_streak(ticker: str, timeframe_or_period, ma_period: int | None =
 def get_reclaim_streak_full(ticker: str, timeframe: str, ma_period: int) -> dict:
     """Returns full reclaim tracker row as dict, or defaults if not found."""
     rows = _db().execute(
-        "SELECT consecutive_closes, streak_start, last_bar_date, last_updated "
+        "SELECT consecutive_closes, streak_start, last_bar_date, was_broken, last_updated "
         "FROM reclaim_tracker WHERE ticker = ? AND timeframe = ? AND ma_period = ?",
         [ticker, timeframe, ma_period],
     )
@@ -670,6 +731,7 @@ def get_reclaim_streak_full(ticker: str, timeframe: str, ma_period: int) -> dict
         "consecutive_closes": 0,
         "streak_start": None,
         "last_bar_date": None,
+        "was_broken": 0,
         "last_updated": None,
     }
 
@@ -681,13 +743,17 @@ def set_reclaim_streak(
     streak_or_start=None,
     streak_start_or_sentinel=None,
     last_bar_date: date | None = None,
+    was_broken: int | None = None,
 ) -> None:
     """
     Upsert reclaim streak for this (ticker, timeframe, ma_period).
 
     Backward-compatible with old 4-arg call (ticker, ma_period, streak, streak_start).
     New 5-arg call (ticker, timeframe, ma_period, streak, streak_start) is preferred.
-    last_bar_date is keyword-only and always optional.
+    last_bar_date and was_broken are keyword-only and always optional.
+
+    was_broken: None preserves the existing stored value (read-modify-write); pass
+    an explicit 0 or 1 to set it.
     """
     if isinstance(timeframe_or_period, int):
         # Old call shape: set_reclaim_streak(ticker, ma_period, streak, streak_start)
@@ -702,14 +768,20 @@ def set_reclaim_streak(
         streak = streak_or_start
         streak_start = streak_start_or_sentinel
 
+    if was_broken is None:
+        existing = get_reclaim_streak_full(ticker, timeframe, ma_period)
+        was_broken_val = existing.get("was_broken") or 0
+    else:
+        was_broken_val = was_broken
+
     today = date.today().isoformat()
     start_str = streak_start.isoformat() if streak_start else None
     bar_str = last_bar_date.isoformat() if last_bar_date else None
     _db().execute(
         "INSERT OR REPLACE INTO reclaim_tracker "
-        "(ticker, timeframe, ma_period, consecutive_closes, streak_start, last_bar_date, last_updated) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [ticker, timeframe, ma_period, streak, start_str, bar_str, today],
+        "(ticker, timeframe, ma_period, consecutive_closes, streak_start, last_bar_date, was_broken, last_updated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [ticker, timeframe, ma_period, streak, start_str, bar_str, was_broken_val, today],
     )
 
 
