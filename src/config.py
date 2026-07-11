@@ -58,6 +58,34 @@ OHLCV_RETENTION_YEARS: int = 5         # OHLCV rows older than this are pruned
 HALT_FAILURE_THRESHOLD: int = 3        # Send Telegram warning after N consecutive fetch failures
 HALT_WARNING_RESEND_DAYS: int = 7      # Minimum days between repeated halt warnings per ticker
 
+# Twelve Data /time_series `adjust` param. Per Twelve Data docs (confirmed
+# 2026-07-11): supports all|splits|dividends|none, default is "splits".
+# Passed explicitly (rather than relying on the API default) so behavior is
+# self-documenting and immune to Twelve Data silently changing their default.
+TWELVE_DATA_ADJUST: str = "splits"
+
+# A2: OHLCV basis-drift detection. If a re-fetched close for an already-stored
+# (non-newest) bar differs from the stored close by more than this relative
+# fraction, the ticker's full OHLCV history is considered untrustworthy
+# (e.g. a retroactive split/dividend adjustment was applied upstream) and is
+# fully rebaselined via bootstrap_ticker().
+OHLCV_REVISION_TOLERANCE: float = 0.005
+
+# D: pre-dispatch sanity gate (src/sanity.py). Plausibility check — max
+# allowed relative distance between price and ma_value before an alert is
+# considered implausible (likely a data or logic error) and quarantined
+# rather than sent. Wider timeframes tolerate more spread since W/M MAs
+# lag price more during strong trends.
+MA_SANITY_MAX_DEVIATION: dict[str, float] = {
+    "D": 0.35,
+    "W": 0.60,
+    "M": 0.75,
+}
+
+# D: freshness check. Daily alerts whose bar_date is older than this many
+# trading days are considered stale and quarantined rather than sent.
+SANITY_MAX_STALE_TRADING_DAYS: int = 2
+
 
 # ---------------------------------------------------------------------------
 # Watchlist
