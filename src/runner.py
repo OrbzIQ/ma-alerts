@@ -124,6 +124,101 @@ def _load_watchlist_from_yaml(market: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# A2: OHLCV data-basis integrity
+# ---------------------------------------------------------------------------
+
+def _check_and_repair_ohlcv_drift(ticker: str, market: str, candles: list[dict]) -> bool:
+    """
+    Compare freshly-fetched closes against stored closes for overlapping
+    dates (excluding the newest fetched bar, which is expected to move) and
+    trigger a full rebaseline if any historical close has drifted beyond
+    OHLCV_REVISION_TOLERANCE.
+
+    A drift of this kind indicates the ticker's stored OHLCV basis is stale
+    relative to the provider's current adjustment (e.g. a split/dividend
+    adjustment was applied retroactively upstream) — patching incrementally
+    would leave old bars on the old basis and new bars on the new basis,
+    corrupting every MA that spans the boundary.
+
+    Returns True if drift was detected and the repair path ran (caller should
+    treat the DB as already holding the full, correct history and skip its
+    own upsert of `candles`). Returns False if no drift was detected (caller
+    proceeds with its normal incremental upsert).
+    """
+    import src.db as db
+    from src.alerter import send_ops_message
+    from src.bootstrap import bootstrap_ticker
+    from src.config import BOOTSTRAP_MAX_CANDLES, OHLCV_REVISION_TOLERANCE
+
+    if not candles:
+        return False
+
+    # Exclude the newest fetched bar — only compare bars that were already
+    # stored from a prior run and are not expected to still be moving.
+    historical = candles[:-1] if len(candles) > 1 else []
+    if not historical:
+        return False
+
+    fetched_by_date = {c["date"]: float(c["close"]) for c in historical}
+    stored_by_date = db.get_closes_for_dates(ticker, list(fetched_by_date.keys()))
+
+    drifted_dates = []
+    for d, fetched_close in fetched_by_date.items():
+        stored_close = stored_by_date.get(d)
+        if stored_close is None or stored_close == 0:
+            continue
+        rel_diff = abs(fetched_close - stored_close) / abs(stored_close)
+        if rel_diff > OHLCV_REVISION_TOLERANCE:
+            drifted_dates.append((d, stored_close, fetched_close, rel_diff))
+
+    if not drifted_dates:
+        return False
+
+    logger.warning(
+        "OHLCV basis drift detected for %s — %d date(s) exceed tolerance %.4f "
+        "(e.g. %s: stored=%.4f fetched=%.4f diff=%.4f) — refetching full history",
+        ticker, len(drifted_dates), OHLCV_REVISION_TOLERANCE, *drifted_dates[0],
+    )
+
+    try:
+        send_ops_message(f"OHLCV basis drift detected for {ticker} — refetching full history")
+    except Exception as exc:
+        logger.error("Failed to send drift-detection ops alert for %s: %s", ticker, exc)
+
+    # Refetch full history and atomically replace all stored rows.
+    from src.fetcher import fetch_daily_ohlcv
+    full_candles = fetch_daily_ohlcv(ticker, market, outputsize=BOOTSTRAP_MAX_CANDLES)
+    if not full_candles:
+        logger.error(
+            "OHLCV drift repair for %s: full refetch returned no candles — "
+            "leaving existing (drifted) history in place, skipping this run's detection",
+            ticker,
+        )
+        return True  # still signal "drift handled" so caller doesn't double-upsert
+
+    db.replace_ohlcv_atomic(ticker, full_candles)
+    db.reset_reclaim_tracker_for_ticker(ticker)
+
+    # Recompute cascade_state from the repaired history. Reuses bootstrap_ticker
+    # wholesale per the accepted tradeoff (redundant network re-fetch inside
+    # bootstrap_ticker, and touch_log gets repopulated by its own logic rather
+    # than staying strictly untouched) rather than duplicating bootstrap's
+    # replay loop as a standalone function.
+    bootstrap_ok = bootstrap_ticker(ticker, market)
+    if not bootstrap_ok:
+        logger.error("OHLCV drift repair for %s: bootstrap_ticker re-run failed", ticker)
+
+    # bootstrap_ticker() may have repopulated reclaim_tracker from its own
+    # backward-scan (mid-streak detection) — re-apply A2's prescribed reset
+    # (streak 0, streak_start NULL, was_broken 0) so the repaired ticker starts
+    # this cycle from a clean slate rather than bootstrap's inferred streak.
+    db.reset_reclaim_tracker_for_ticker(ticker)
+
+    logger.info("OHLCV drift repair complete for %s", ticker)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Per-ticker processing
 # ---------------------------------------------------------------------------
 
@@ -162,8 +257,29 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
             logger.warning("Skipping %s — no candles returned", ticker)
             return []
 
-        # 4d. Upsert OHLCV
-        db.upsert_ohlcv(ticker, candles)
+        # 4c-bis. A2: OHLCV basis-drift check. Compare freshly-fetched closes
+        # against what's already stored, for overlapping dates EXCLUDING the
+        # newest bar (the newest bar is expected to change intraday/on revision
+        # and isn't itself evidence of a basis change). If any overlapping
+        # historical close has drifted beyond OHLCV_REVISION_TOLERANCE, the
+        # ticker's whole stored history is untrustworthy (e.g. a retroactive
+        # split/dividend adjustment was applied upstream) — refetch full
+        # history, atomically replace all stored rows, reset reclaim state,
+        # and recompute cascade_state before continuing the pipeline.
+        _drift_detected = _check_and_repair_ohlcv_drift(ticker, market, candles)
+        if _drift_detected:
+            # Repair path already refetched + replaced OHLCV + reset reclaim
+            # state + recomputed cascade_state via bootstrap_ticker(). Reload
+            # candles from the now-repaired DB history for the rest of this
+            # run instead of re-upserting the (possibly still basis-shifted)
+            # incremental fetch on top.
+            candles = None  # signal: DB already holds the correct, full history
+
+        # 4d. Upsert OHLCV (skipped if the drift-repair path already replaced
+        # the full history — re-upserting the original incremental fetch on
+        # top of freshly-rebaselined data would reintroduce the drift).
+        if candles is not None:
+            db.upsert_ohlcv(ticker, candles)
 
         # 4e. Build DataFrames with MAs (use all history for MA accuracy)
         daily_df = db.get_all_ohlcv(ticker)
@@ -408,6 +524,84 @@ def main(market: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# A3: manual rebaseline entry point
+# ---------------------------------------------------------------------------
+
+def main_rebaseline(tickers: list[str]) -> int:
+    """
+    Force the A2 OHLCV repair path for the named tickers, then exit.
+
+    Unlike a normal scan, this doesn't compare against a freshly-fetched
+    incremental candle set to detect drift — it unconditionally treats each
+    named ticker as needing a full rebaseline: refetch full history, replace
+    all stored OHLCV atomically, reset reclaim state, recompute cascade_state.
+
+    Returns exit code: 0 if all tickers rebaselined successfully, 1 if any
+    failed (details logged per-ticker; does not abort the batch early).
+    """
+    import src.db as db
+    from src.alerter import send_ops_message
+    from src.bootstrap import bootstrap_ticker
+    from src.config import BOOTSTRAP_MAX_CANDLES
+    from src.fetcher import fetch_daily_ohlcv
+
+    try:
+        _check_env()
+    except RuntimeError as exc:
+        logger.critical("%s", exc)
+        return _fail_and_alert(str(exc))
+
+    try:
+        db.init_schema()
+    except Exception as exc:
+        logger.critical("Schema init failed: %s", exc)
+        return _fail_and_alert(f"schema init failed: {exc}")
+
+    # Look up each ticker's market from the watchlist (any market, active or not
+    # doesn't matter for a manual rebaseline — the ticker must already exist).
+    all_entries = db.get_watchlist(market=None)
+    market_by_ticker = {e["ticker"]: e["market"] for e in all_entries}
+
+    failures: list[str] = []
+    for ticker in tickers:
+        market = market_by_ticker.get(ticker)
+        if market is None:
+            logger.error("--rebaseline %s: ticker not found in watchlist — skipping", ticker)
+            failures.append(ticker)
+            continue
+
+        logger.info("Rebaselining %s (%s)...", ticker, market)
+        full_candles = fetch_daily_ohlcv(ticker, market, outputsize=BOOTSTRAP_MAX_CANDLES)
+        if not full_candles:
+            logger.error("--rebaseline %s: full refetch returned no candles", ticker)
+            failures.append(ticker)
+            continue
+
+        db.replace_ohlcv_atomic(ticker, full_candles)
+        db.reset_reclaim_tracker_for_ticker(ticker)
+        bootstrap_ok = bootstrap_ticker(ticker, market)
+        db.reset_reclaim_tracker_for_ticker(ticker)  # re-apply after bootstrap's own repopulation
+
+        if not bootstrap_ok:
+            logger.error("--rebaseline %s: bootstrap_ticker re-run failed", ticker)
+            failures.append(ticker)
+            continue
+
+        logger.info("Rebaseline complete for %s", ticker)
+
+    summary = f"Rebaseline complete: {len(tickers) - len(failures)}/{len(tickers)} succeeded"
+    if failures:
+        summary += f" — failed: {', '.join(failures)}"
+    logger.info(summary)
+    try:
+        send_ops_message(summary)
+    except Exception as exc:
+        logger.error("Failed to send rebaseline summary ops alert: %s", exc)
+
+    return 0 if not failures else 1
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -425,13 +619,31 @@ if __name__ == "__main__":
         action="store_true",
         help="Send a test ping to Telegram and exit (bypasses main pipeline)",
     )
+    parser.add_argument(
+        "--rebaseline",
+        type=str,
+        default=None,
+        metavar="TICKER[,TICKER...]",
+        help=(
+            "Force the A2 OHLCV data-basis repair path for the named ticker(s) "
+            "(comma-separated), then exit. Mutually exclusive with a normal scan."
+        ),
+    )
     args = parser.parse_args()
 
     if args.test_telegram:
         from src.alerter import send_test_ping
         sys.exit(0 if send_test_ping() else 1)
 
+    if args.rebaseline:
+        if args.market:
+            parser.error("--rebaseline cannot be combined with --market (mutually exclusive)")
+        _tickers = [t.strip() for t in args.rebaseline.split(",") if t.strip()]
+        if not _tickers:
+            parser.error("--rebaseline requires at least one ticker")
+        sys.exit(main_rebaseline(_tickers))
+
     if not args.market:
-        parser.error("--market is required when not using --test-telegram")
+        parser.error("--market is required when not using --test-telegram or --rebaseline")
 
     sys.exit(main(args.market))

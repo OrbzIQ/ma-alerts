@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS reclaim_tracker (
     streak_start        DATE,
     last_bar_date       TEXT,                        -- most recently counted bar date (idempotency)
     was_broken          INTEGER NOT NULL DEFAULT 0,   -- 1 = price has closed <= MA since last reset
+    last_break_date     TEXT,                        -- bar date of most recent close <= MA (display-only, never cleared by post-fire reset)
     last_updated        DATE NOT NULL,
     PRIMARY KEY (ticker, timeframe, ma_period),
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
@@ -154,6 +155,20 @@ class _Sqlite3Backend:
         assert self._conn is not None
         self._conn.executescript(script)
         self._conn.commit()
+
+    def execute_batch_atomic(self, statements: list[tuple[str, list[Any] | None]]) -> None:
+        """
+        Execute a list of (sql, params) statements as a single atomic transaction.
+        All statements commit together, or none do (rollback on any exception).
+        """
+        assert self._conn is not None
+        try:
+            for sql, params in statements:
+                self._conn.execute(sql, params or [])
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def close(self) -> None:
         if self._conn:
@@ -274,6 +289,34 @@ class _LibsqlBackend:
         requests_payload = [self._to_stmt(s, None) for s in stmts]
         requests_payload.append({"type": "close"})
         self._pipeline(requests_payload)
+
+    def execute_batch_atomic(self, statements: list[tuple[str, list[Any] | None]]) -> None:
+        """
+        Execute a list of (sql, params) statements as a single atomic transaction.
+
+        Wraps the statements in explicit BEGIN/COMMIT so the whole batch is one
+        transaction even though it's sent as a single pipeline request (Turso's
+        HTTP pipeline API does not itself guarantee statement-list atomicity —
+        it just executes each statement in the connection context in order).
+        """
+        if not statements:
+            return
+        requests_payload = [self._to_stmt("BEGIN", None)]
+        requests_payload.extend(self._to_stmt(sql, params) for sql, params in statements)
+        requests_payload.append(self._to_stmt("COMMIT", None))
+        requests_payload.append({"type": "close"})
+        try:
+            self._pipeline(requests_payload)
+        except Exception:
+            # Best-effort rollback — if BEGIN succeeded but a later statement
+            # failed, the connection this pipeline opened is already closing
+            # (pipeline calls are per-request), so an explicit ROLLBACK in a
+            # fresh pipeline is required to undo a partially-applied BEGIN.
+            try:
+                self._pipeline([self._to_stmt("ROLLBACK", None), {"type": "close"}])
+            except Exception:
+                pass
+            raise
 
     def close(self) -> None:
         self._connected = False
@@ -552,6 +595,43 @@ def _migrate_reclaim_tracker_v3() -> None:
         logger.error("reclaim_tracker V3 migration failed: %s", exc)
 
 
+def _migrate_reclaim_tracker_v4() -> None:
+    """
+    V4 migration: add last_break_date TEXT column to reclaim_tracker.
+
+    last_break_date records the bar date on which price last closed AT OR
+    BELOW this MA (the most recent "break"). Unlike was_broken (a boolean
+    gate that gets cleared on post-fire reset), last_break_date is display-only
+    transparency data and is NEVER cleared by a post-fire reset — it always
+    reflects the most recent break, even after a reclaim has fired and the
+    streak/was_broken fields have been zeroed for the next cycle.
+
+    Idempotent: checks sqlite_master for the last_break_date column first.
+    """
+    try:
+        rows = _db().execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='reclaim_tracker'"
+        )
+    except Exception as exc:
+        logger.warning("reclaim_tracker V4 migration: sqlite_master read failed (%s) — skipping", exc)
+        return
+
+    if not rows:
+        return  # table doesn't exist yet; fresh _SCHEMA_SQL DDL creates it with last_break_date
+
+    table_sql: str = (rows[0].get("sql") or "")
+    if "last_break_date" in table_sql:
+        return  # already migrated
+
+    try:
+        _db().execute(
+            "ALTER TABLE reclaim_tracker ADD COLUMN last_break_date TEXT"
+        )
+        logger.info("reclaim_tracker V4 migration complete — last_break_date added")
+    except Exception as exc:
+        logger.error("reclaim_tracker V4 migration failed: %s", exc)
+
+
 def _migrate_api_usage_v1() -> None:
     """
     B3 migration: ensure api_usage table exists on DBs created before B3.
@@ -594,6 +674,7 @@ def init_schema() -> None:
     _migrate_alert_log_v3()
     _migrate_reclaim_tracker_v2()
     _migrate_reclaim_tracker_v3()
+    _migrate_reclaim_tracker_v4()
     _migrate_api_usage_v1()
     logger.info("Schema initialised (or already up to date)")
 
@@ -616,6 +697,66 @@ def upsert_ohlcv(ticker: str, candles: list[dict]) -> None:
     ]
     _db().executemany(sql, params_list)
     logger.debug("Upserted %d OHLCV rows for %s", len(candles), ticker)
+
+
+def get_closes_for_dates(ticker: str, dates: list[str]) -> dict[str, float]:
+    """
+    Return stored close prices for a ticker on the given dates (ISO strings).
+
+    Used by the A2 basis-drift check to compare freshly-fetched closes
+    against what's already stored, for dates where both exist.
+
+    Returns {date_iso: close}. Dates with no stored row are simply absent
+    from the result (not an error).
+    """
+    if not dates:
+        return {}
+    placeholders = ",".join("?" for _ in dates)
+    rows = _db().execute(
+        f"SELECT date, close FROM ohlcv WHERE ticker = ? AND date IN ({placeholders})",
+        [ticker, *dates],
+    )
+    return {r["date"]: float(r["close"]) for r in rows}
+
+
+def replace_ohlcv_atomic(ticker: str, candles: list[dict]) -> None:
+    """
+    Atomically replace ALL stored OHLCV rows for a ticker with `candles`
+    (delete existing rows, insert new ones, single transaction — all-or-nothing).
+
+    Used by the A2 basis-drift repair path: once a data-basis revision is
+    detected, the ticker's entire history is untrustworthy and must be
+    replaced wholesale rather than patched incrementally.
+    """
+    statements: list[tuple[str, list[Any] | None]] = [
+        ("DELETE FROM ohlcv WHERE ticker = ?", [ticker]),
+    ]
+    insert_sql = (
+        "INSERT INTO ohlcv (ticker, date, open, high, low, close, volume) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    for c in candles:
+        statements.append(
+            (insert_sql, [ticker, c["date"], c["open"], c["high"], c["low"], c["close"], c["volume"]])
+        )
+    _db().execute_batch_atomic(statements)
+    logger.info("Atomically replaced %d OHLCV rows for %s", len(candles), ticker)
+
+
+def reset_reclaim_tracker_for_ticker(ticker: str) -> None:
+    """
+    Reset all reclaim_tracker rows for a ticker to the post-rebaseline state
+    prescribed by A2: streak 0, streak_start NULL, was_broken 0. last_break_date
+    is left as-is (spec: "keep last_break_date NULL ok" — i.e. no requirement
+    to force it, existing values are acceptable to leave since the OHLCV basis
+    itself is being fully replaced, not the historical break record).
+    """
+    _db().execute(
+        "UPDATE reclaim_tracker SET consecutive_closes = 0, streak_start = NULL, was_broken = 0 "
+        "WHERE ticker = ?",
+        [ticker],
+    )
+    logger.info("Reset reclaim_tracker rows for %s (post-rebaseline)", ticker)
 
 
 def get_ohlcv(ticker: str, days: int) -> pd.DataFrame:
@@ -721,7 +862,7 @@ def get_reclaim_streak(ticker: str, timeframe_or_period, ma_period: int | None =
 def get_reclaim_streak_full(ticker: str, timeframe: str, ma_period: int) -> dict:
     """Returns full reclaim tracker row as dict, or defaults if not found."""
     rows = _db().execute(
-        "SELECT consecutive_closes, streak_start, last_bar_date, was_broken, last_updated "
+        "SELECT consecutive_closes, streak_start, last_bar_date, was_broken, last_break_date, last_updated "
         "FROM reclaim_tracker WHERE ticker = ? AND timeframe = ? AND ma_period = ?",
         [ticker, timeframe, ma_period],
     )
@@ -732,6 +873,7 @@ def get_reclaim_streak_full(ticker: str, timeframe: str, ma_period: int) -> dict
         "streak_start": None,
         "last_bar_date": None,
         "was_broken": 0,
+        "last_break_date": None,
         "last_updated": None,
     }
 
@@ -744,16 +886,23 @@ def set_reclaim_streak(
     streak_start_or_sentinel=None,
     last_bar_date: date | None = None,
     was_broken: int | None = None,
+    last_break_date: date | None = None,
 ) -> None:
     """
     Upsert reclaim streak for this (ticker, timeframe, ma_period).
 
     Backward-compatible with old 4-arg call (ticker, ma_period, streak, streak_start).
     New 5-arg call (ticker, timeframe, ma_period, streak, streak_start) is preferred.
-    last_bar_date and was_broken are keyword-only and always optional.
+    last_bar_date, was_broken, and last_break_date are keyword-only and always optional.
 
     was_broken: None preserves the existing stored value (read-modify-write); pass
     an explicit 0 or 1 to set it.
+
+    last_break_date: None preserves the existing stored value (read-modify-write) —
+    this field is display-only transparency data and must NOT be cleared by the
+    post-fire reset in _detect_3b_for_timeframe, so callers that aren't recording a
+    fresh break should never pass this argument. Pass an explicit date to update it
+    (only the break branch in _detect_3b_for_timeframe does this).
     """
     if isinstance(timeframe_or_period, int):
         # Old call shape: set_reclaim_streak(ticker, ma_period, streak, streak_start)
@@ -768,20 +917,28 @@ def set_reclaim_streak(
         streak = streak_or_start
         streak_start = streak_start_or_sentinel
 
-    if was_broken is None:
+    existing = None
+    if was_broken is None or last_break_date is None:
         existing = get_reclaim_streak_full(ticker, timeframe, ma_period)
-        was_broken_val = existing.get("was_broken") or 0
+
+    if was_broken is None:
+        was_broken_val = (existing.get("was_broken") or 0) if existing else 0
     else:
         was_broken_val = was_broken
+
+    if last_break_date is None:
+        break_date_str = existing.get("last_break_date") if existing else None
+    else:
+        break_date_str = last_break_date.isoformat()
 
     today = date.today().isoformat()
     start_str = streak_start.isoformat() if streak_start else None
     bar_str = last_bar_date.isoformat() if last_bar_date else None
     _db().execute(
         "INSERT OR REPLACE INTO reclaim_tracker "
-        "(ticker, timeframe, ma_period, consecutive_closes, streak_start, last_bar_date, was_broken, last_updated) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [ticker, timeframe, ma_period, streak, start_str, bar_str, was_broken_val, today],
+        "(ticker, timeframe, ma_period, consecutive_closes, streak_start, last_bar_date, was_broken, last_break_date, last_updated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [ticker, timeframe, ma_period, streak, start_str, bar_str, was_broken_val, break_date_str, today],
     )
 
 

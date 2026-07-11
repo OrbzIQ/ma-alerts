@@ -131,12 +131,15 @@ def fetch_daily_ohlcv(
         outputsize: Number of bars to request (max 5000). Use 30 for incremental,
                     5000 for bootstrap.
     """
+    from src.config import TWELVE_DATA_ADJUST
+
     symbol = _map_symbol(ticker, market)
     params: dict[str, Any] = {
         "symbol": symbol,
         "interval": "1day",
         "outputsize": outputsize,
         "format": "JSON",
+        "adjust": TWELVE_DATA_ADJUST,
         "apikey": _api_key(),
     }
 

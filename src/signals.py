@@ -392,7 +392,17 @@ def _detect_3b_for_timeframe(
 
     _compute_ma(df, MA_PERIODS)
 
-    bar = _latest_completed_bar(df, date.today())
+    if timeframe == "D":
+        # Daily: evaluate the latest stored daily bar directly. Using
+        # _latest_completed_bar here (which excludes "today" if the scan
+        # runs intraday) introduces a one-day lag for Daily reclaim streaks —
+        # the 7th qualifying close wouldn't be counted until the NEXT day's
+        # scan. Daily bars in the DB are always end-of-day closes (fetched
+        # once per scan), so df.iloc[-1] is always a completed bar; no
+        # "still forming" risk the way there is for W/M.
+        bar = df.iloc[-1]
+    else:
+        bar = _latest_completed_bar(df, date.today())
     if bar is None:
         return None
 
@@ -449,6 +459,9 @@ def _detect_3b_for_timeframe(
 
         if new_streak == required_streak:
             current_step = cascade_state.get("current_step", 1)
+            break_date_raw = tracker.get("last_break_date")
+            break_date_iso = break_date_raw if break_date_raw else None
+            first_reclaim_date_iso = streak_start.isoformat() if streak_start else None
             alert = build_alert(
                 ticker=ticker,
                 signal_type="RECLAIM",
@@ -460,6 +473,8 @@ def _detect_3b_for_timeframe(
                     "streak": new_streak,
                     "previous_step": current_step,
                     "new_step": max(1, current_step - 1),
+                    "break_date": break_date_iso,
+                    "first_reclaim_date": first_reclaim_date_iso,
                 },
                 volume_ratio=None,
                 bar_date=bar_date_val,
@@ -483,12 +498,15 @@ def _detect_3b_for_timeframe(
     else:
         # Close at or below MA — reset streak. For W/M, this is the break that
         # arms the reclaim gate (was_broken=1) for the next above-MA close.
+        # Also records this bar's date as the most recent break, for display
+        # transparency (B1/B4) — this is never cleared by the post-fire reset.
         if current_streak > 0:
             logger.debug("3B streak reset for %s %s%d", ticker, timeframe, ma_period)
         new_was_broken = 1 if timeframe in ("W", "M") else 0
         db.set_reclaim_streak(
             ticker, timeframe, ma_period, 0, None,
             last_bar_date=bar_date_val, was_broken=new_was_broken,
+            last_break_date=bar_date_val,
         )
 
     return None

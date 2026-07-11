@@ -56,8 +56,18 @@ def isolated_db():
 # DataFrame builders
 # ---------------------------------------------------------------------------
 
-def _make_daily_df(n=60, base_close=200.0, trend=0.0, volume=1_000_000):
-    dates = pd.bdate_range(end="2026-05-22", periods=n)
+def _make_daily_df(n=60, base_close=200.0, trend=0.0, volume=1_000_000, end=None):
+    """
+    Build a synthetic daily OHLCV DataFrame ending on `end` (defaults to
+    date.today() so tests derive their "today" from the fixture itself
+    instead of a hardcoded calendar date drifting out of sync with the
+    wall clock). Tests that need to reference "today" for touch_log /
+    reclaim_streak dates should use the DataFrame's own last index date
+    (df.index[-1].date()) rather than calling date.today() directly.
+    """
+    if end is None:
+        end = date.today()
+    dates = pd.bdate_range(end=end, periods=n)
     closes = [base_close + i * trend for i in range(n)]
     return pd.DataFrame(
         {
@@ -194,7 +204,8 @@ class TestDetect3BReclaim:
         df = _make_daily_df(n=60, base_close=210.0)
         _add_mas(df, (50,))
         ma_val = float(df["ma_50"].iloc[-1])
-        db.set_reclaim_streak("TEST", 50, 3, date.today() - timedelta(days=3))
+        today = df.index[-1].date()
+        db.set_reclaim_streak("TEST", 50, 3, today - timedelta(days=3))
         df.iloc[-1, df.columns.get_loc("close")] = ma_val - 5.0
         self._run(df, _cascade_state())
         assert db.get_reclaim_streak("TEST", 50) == 0
@@ -204,7 +215,8 @@ class TestDetect3BReclaim:
         df = _make_daily_df(n=60, base_close=210.0)
         _add_mas(df, (50,))
         ma_val = float(df["ma_50"].iloc[-1])
-        db.set_reclaim_streak("TEST", 50, 6, date.today() - timedelta(days=6))
+        today = df.index[-1].date()
+        db.set_reclaim_streak("TEST", 50, 6, today - timedelta(days=6))
         df.iloc[-1, df.columns.get_loc("close")] = ma_val + 2.0
         result = self._run(df, _cascade_state())
         assert result is not None
@@ -217,7 +229,8 @@ class TestDetect3BReclaim:
         df = _make_daily_df(n=60, base_close=210.0)
         _add_mas(df, (50,))
         ma_val = float(df["ma_50"].iloc[-1])
-        db.set_reclaim_streak("TEST", 50, 5, date.today() - timedelta(days=5))
+        today = df.index[-1].date()
+        db.set_reclaim_streak("TEST", 50, 5, today - timedelta(days=5))
         df.iloc[-1, df.columns.get_loc("close")] = ma_val + 2.0
         result = self._run(df, _cascade_state())
         assert result is None
@@ -228,14 +241,15 @@ class TestDetect3BReclaim:
         _add_mas(df, (50,))
         ma_val = float(df["ma_50"].iloc[-1])
         state = _cascade_state()
-        db.set_reclaim_streak("TEST", 50, 6, date.today() - timedelta(days=6))
+        today = df.index[-1].date()
+        db.set_reclaim_streak("TEST", 50, 6, today - timedelta(days=6))
         df.iloc[-1, df.columns.get_loc("close")] = ma_val + 2.0
         r1 = self._run(df, state)
         assert r1 is not None
         df.iloc[-1, df.columns.get_loc("close")] = ma_val - 5.0
         self._run(df, state)
         assert db.get_reclaim_streak("TEST", 50) == 0
-        db.set_reclaim_streak("TEST", 50, 6, date.today() - timedelta(days=6))
+        db.set_reclaim_streak("TEST", 50, 6, today - timedelta(days=6))
         df.iloc[-1, df.columns.get_loc("close")] = ma_val + 2.0
         r2 = self._run(df, state)
         assert r2 is not None
@@ -248,7 +262,8 @@ class TestDetect3BReclaim:
         df = _make_daily_df(n=60, base_close=210.0)
         _add_mas(df, (50,))
         ma_val = float(df["ma_50"].iloc[-1])
-        db.set_reclaim_streak("TEST", 50, 6, date.today() - timedelta(days=6))
+        today = df.index[-1].date()
+        db.set_reclaim_streak("TEST", 50, 6, today - timedelta(days=6))
         df.iloc[-1, df.columns.get_loc("close")] = ma_val + 2.0
         result = self._run(df, _cascade_state())
         assert result is not None
@@ -257,6 +272,56 @@ class TestDetect3BReclaim:
         assert row["consecutive_closes"] == 0
         assert row["streak_start"] is None
         assert row["was_broken"] == 0
+
+    def test_daily_evaluates_latest_bar_even_when_today_is_not_a_business_day(self):
+        """
+        B3 regression: Daily 3B must evaluate df.iloc[-1] (the latest stored
+        daily bar), not _latest_completed_bar(df, date.today()). The old
+        behavior excluded any bar dated today-or-later, which introduced a
+        one-day lag whenever the fixture's last bar happened to land exactly
+        on date.today() (e.g. any weekday scan) -- the 7th qualifying close
+        would silently not count until the next day's scan.
+
+        This test forces the fixture's last bar to be dated exactly
+        date.today() (regardless of what day of the week "today" is in the
+        environment) and confirms the streak still increments/fires on that
+        bar, proving Daily no longer defers to the "strictly before today"
+        completed-bar rule that W/M timeframes still use.
+        """
+        import src.db as db
+        from src.signals import _detect_3b_for_timeframe
+
+        n = 60
+        today = date.today()
+        dates = list(pd.bdate_range(end=today, periods=n - 1)) + [pd.Timestamp(today)]
+        closes = [210.0] * n
+        df = pd.DataFrame(
+            {
+                "open":   [c - 1.0 for c in closes],
+                "high":   [c + 2.0 for c in closes],
+                "low":    [c - 2.0 for c in closes],
+                "close":  closes,
+                "volume": [1_000_000] * n,
+            },
+            index=pd.DatetimeIndex(dates),
+        )
+        _add_mas(df, (50,))
+        ma_val = float(df["ma_50"].iloc[-1])
+
+        db.set_reclaim_streak("TEST", "D", 50, 6, today - timedelta(days=6))
+        df.iloc[-1, df.columns.get_loc("close")] = ma_val + 2.0
+
+        assert df.index[-1].date() == today, "Fixture's last bar must be dated exactly today"
+
+        result = _detect_3b_for_timeframe(
+            "TEST", df, "D", 50, _cascade_state(), required_streak=7,
+        )
+        assert result is not None, (
+            "Daily reclaim must fire on today's bar, not lag one day behind "
+            "(B3: Daily must use df.iloc[-1], not the strictly-before-today "
+            "completed-bar rule)"
+        )
+        assert result["extra"]["streak"] == 7
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +644,7 @@ def _make_3d_uptrend(n: int = 250, trend: float = 0.5, hist_volume: int = 1_000_
     With trend > 0: D20 > D50 > D100 > D150 > D200 naturally (shorter MA > longer MA).
     MAs are NOT pre-computed; caller must call _add_mas() before passing to detect_3d.
     """
-    dates = pd.bdate_range(end="2026-05-22", periods=n)
+    dates = pd.bdate_range(end=date.today(), periods=n)
     closes = [100.0 + i * trend for i in range(n)]
     return pd.DataFrame(
         {

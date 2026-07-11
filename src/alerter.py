@@ -18,7 +18,8 @@ import requests
 from dotenv import load_dotenv
 
 import src.db as db
-from src.labels import label_for
+from src.labels import label_for, step_label
+from src.sanity import check_alert
 
 load_dotenv()
 
@@ -59,6 +60,19 @@ def _fmt_float(value: float | None, decimals: int = 2) -> str:
 def _tf_label(tf: str) -> str:
     """Human-readable timeframe label."""
     return {"D": "Daily", "W": "Weekly", "M": "Monthly"}.get(tf, tf)
+
+
+def _ordinal(n) -> str:
+    """Return the ordinal string for an int (1st, 2nd, 3rd, 7th, ...)."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return f"{n}th"
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
 
 
 def _fmt_bar_date(bar_date) -> str:
@@ -132,13 +146,15 @@ def _format_3b(alert: dict) -> str:
     streak = extra.get("streak", 7)
     prev_step = extra.get("previous_step", "?")
     new_step = extra.get("new_step", "?")
+    break_date_str = _fmt_bar_date(extra.get("break_date"))
+    first_reclaim_date_str = _fmt_bar_date(extra.get("first_reclaim_date"))
 
     # Daily: show cascade step change; W/M: omit (no de-escalation)
     streak_unit = "days" if tf == "D" else "closes"
     if tf == "D":
         state_line = (
-            f"Previous state:      {_escape_md2(f'Step {prev_step}')} "
-            f"→ {_escape_md2(f'now Step {new_step}')}\n"
+            f"Trend status:        {_escape_md2(step_label(prev_step))} "
+            f"→ {_escape_md2(f'now: {step_label(new_step)}')}\n"
         )
     else:
         state_line = ""
@@ -159,7 +175,9 @@ def _format_3b(alert: dict) -> str:
         f"MA reclaimed:        {ma_label} @ {ma_val}\n"
         f"Consecutive {streak_unit}: {_escape_md2(f'{streak} closes above')}\n"
         f"Timeframe:           {tf_label}\n"
-        f"Bar date:            {bar_date_str}\n"
+        f"Broken on:           {break_date_str} {_escape_md2('(price first lost this MA)')}\n"
+        f"First reclaimed:     {first_reclaim_date_str} {_escape_md2('(price moved back above)')}\n"
+        f"Confirmed:           {bar_date_str} {_escape_md2(f'({_ordinal(streak)} consecutive close above — anti-whipsaw passed)')}\n"
         f"MA vs price:         {ma_vs_price_str}\n"
         f"{state_line}"
         f"\n"
@@ -375,6 +393,32 @@ def dispatch_alerts(alerts: list[dict]) -> int:
                 timeframe or "",
                 ma_period or "",
             )
+            continue
+
+        # FIX D: pre-dispatch sanity gate. An alert that fails this check is
+        # quarantined — not sent to the signal chat, but still recorded in
+        # alert_log (with the failure reason in extra_json) so the run's
+        # history is complete and the quarantine is auditable. A single
+        # [OPS] message is sent per quarantined alert.
+        ok, reason = check_alert(alert)
+        if not ok:
+            logger.warning(
+                "Quarantined by sanity gate: %s %s %s%s — %s",
+                ticker, signal_type, timeframe or "", ma_period or "", reason,
+            )
+            try:
+                send_ops_message(
+                    f"Alert quarantined — {ticker} {signal_type} {timeframe or ''}{ma_period or ''}: {reason}"
+                )
+            except Exception as exc:
+                logger.error("Failed to send quarantine ops alert for %s: %s", ticker, exc)
+
+            quarantined_alert = dict(alert)
+            quarantined_alert["extra"] = {**alert.get("extra", {}), "quarantined": reason}
+            try:
+                db.insert_alert(quarantined_alert)
+            except Exception as exc:
+                logger.error("Failed to persist quarantined alert to DB: %s", exc)
             continue
 
         try:
