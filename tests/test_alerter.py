@@ -12,7 +12,7 @@ import json
 import os
 import tempfile
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from unittest import mock
 
 import pytest
@@ -58,7 +58,9 @@ def _valid_alert(**overrides) -> dict:
         "bar_date": date.today(),
         "volume_ratio": None,
         "extra": {"streak": 7, "previous_step": 2, "new_step": 1},
-        "fired_at": "2026-07-11T00:00:00Z",
+        # Relative to date.today() (not a hardcoded literal) so this fixture
+        # never drifts out of the 5-day cooldown window as real time passes.
+        "fired_at": (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     alert.update(overrides)
     return alert

@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS data_health (
     last_success            DATE,
     consecutive_failures    INTEGER NOT NULL DEFAULT 0,
     last_warning_sent       DATE,                  -- nullable
+    last_deep_audit         TEXT,                  -- Fix 2b: date of last rotating deep drift audit (nullable)
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
 );
 

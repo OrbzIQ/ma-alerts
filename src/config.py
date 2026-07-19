@@ -71,6 +71,15 @@ TWELVE_DATA_ADJUST: str = "splits"
 # fully rebaselined via bootstrap_ticker().
 OHLCV_REVISION_TOLERANCE: float = 0.005
 
+# Fix 2b: rotating deep drift audit. Each scan, the K tickers with the oldest
+# last_deep_audit are re-checked with a much wider fetch (DEEP_AUDIT_OUTPUTSIZE
+# bars instead of the normal 30-bar incremental fetch), closing the blind spot
+# where a basis discontinuity older than 30 bars is invisible to the regular
+# A2 drift check even though it still corrupts 50-200 bar MAs. K=3 rotates
+# a ~42-ticker watchlist through a full audit roughly every 3 weeks.
+DEEP_AUDIT_TICKERS_PER_DAY: int = 3
+DEEP_AUDIT_OUTPUTSIZE: int = 250
+
 # D: pre-dispatch sanity gate (src/sanity.py). Plausibility check — max
 # allowed relative distance between price and ma_value before an alert is
 # considered implausible (likely a data or logic error) and quarantined

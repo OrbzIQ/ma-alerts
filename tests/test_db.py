@@ -186,3 +186,89 @@ class TestResetReclaimTrackerForTicker:
         db.reset_reclaim_tracker_for_ticker("TEST")
         row = db.get_reclaim_streak_full("OTHER", "D", 50)
         assert row["consecutive_closes"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Fix 2b -- data_health.last_deep_audit migration + rotation selection
+# ---------------------------------------------------------------------------
+
+class TestDataHealthV2Migration:
+
+    def test_migration_adds_last_deep_audit_column(self):
+        import src.db as db
+        db.init_schema()
+        rows = db._db().execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='data_health'"
+        )
+        assert rows
+        assert "last_deep_audit" in (rows[0].get("sql") or "")
+
+    def test_migration_is_idempotent_running_twice(self):
+        import src.db as db
+        db.init_schema()
+        db.init_schema()  # must not raise on the already-migrated column
+        rows = db._db().execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='data_health'"
+        )
+        assert "last_deep_audit" in (rows[0].get("sql") or "")
+
+
+class TestDeepAuditRotation:
+
+    def test_last_deep_audit_survives_a_fetch_success_update(self):
+        """
+        update_data_health() uses INSERT OR REPLACE, which overwrites the
+        WHOLE row -- last_deep_audit must be explicitly carried forward or a
+        plain daily fetch-success update would silently wipe out the Fix 2b
+        rotation state.
+        """
+        import src.db as db
+        from datetime import date
+        db.init_schema()
+        db.add_watchlist_ticker("AAA", "US")
+
+        db.set_deep_audit_date("AAA", date(2026, 6, 1))
+        db.update_data_health("AAA", success=True)
+
+        health = db.get_data_health("AAA")
+        assert health["last_deep_audit"] == "2026-06-01"
+        assert health["last_success"] == date.today().isoformat()
+
+    def test_last_deep_audit_survives_a_fetch_failure_update(self):
+        import src.db as db
+        from datetime import date
+        db.init_schema()
+        db.add_watchlist_ticker("AAA", "US")
+
+        db.set_deep_audit_date("AAA", date(2026, 6, 1))
+        db.update_data_health("AAA", success=False)
+
+        health = db.get_data_health("AAA")
+        assert health["last_deep_audit"] == "2026-06-01"
+        assert health["consecutive_failures"] == 1
+
+    def test_get_tickers_for_deep_audit_prioritises_never_audited(self):
+        import src.db as db
+        from datetime import date
+        db.init_schema()
+        db.add_watchlist_ticker("OLD_AUDIT", "US")
+        db.add_watchlist_ticker("NEVER_AUDITED", "US")
+        db.add_watchlist_ticker("RECENT_AUDIT", "US")
+
+        db.set_deep_audit_date("OLD_AUDIT", date(2026, 1, 1))
+        db.set_deep_audit_date("RECENT_AUDIT", date(2026, 7, 1))
+        # NEVER_AUDITED has no data_health row touched -- last_deep_audit is NULL.
+
+        due = db.get_tickers_for_deep_audit(2)
+        assert due == ["NEVER_AUDITED", "OLD_AUDIT"], (
+            "NULLs (never audited) must sort before any real date, then "
+            "oldest date first"
+        )
+
+    def test_get_tickers_for_deep_audit_respects_k_limit(self):
+        import src.db as db
+        db.init_schema()
+        for t in ("A", "B", "C", "D", "E"):
+            db.add_watchlist_ticker(t, "US")
+        due = db.get_tickers_for_deep_audit(3)
+        assert len(due) == 3
