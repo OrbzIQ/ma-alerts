@@ -208,11 +208,22 @@ def detect_3a_ma_support(
     """
     Detect MA Support signals (3A) for a ticker at its current cascade step.
 
-    For each timeframe group at this step:
+    Daily (Fix 3 / Bug 3): evaluated INDEPENDENTLY across all of D50/D100/
+    D150/D200 (src.config.MA_PERIODS) rather than just the single cascade-step
+    proximity winner — a CASCADE_CHECKS/proximity-winner design that meant a
+    wick spanning two stacked Daily MAs could only ever produce one alert (the
+    designed behavior for the original spec, changed here per Glenn's decision).
+    Volume is evaluated once per bar and shared across all qualifying levels.
+    A touch_log row is recorded per qualifying Daily level (so 3C accumulates
+    correctly per MA), but only ONE consolidated Telegram message is emitted
+    per ticker per bar: the primary level is the highest-period qualifying MA,
+    with any others listed in extra.also_touched (see alerter._format_3a).
+
+    W/M (unchanged): for each timeframe group at this step,
       1. Apply proximity rule (per-timeframe): find the highest-period MA that price
          is currently above.
-      2. Check today's bar: wick touched MA (low ≤ MA), closed above MA (close > MA),
-         and volume ≥ 1.5× 20-day daily average.
+      2. Check the last completed bar: wick touched MA (low ≤ MA), closed above MA
+         (close > MA), and volume ≥ 1.5× 20-day daily average.
       3. On pass: record the touch in touch_log AND emit an alert dict.
 
     Returns list of alert dicts (empty if nothing fires).
@@ -234,7 +245,71 @@ def detect_3a_ma_support(
     today_low: float = float(today_bar["low"])
     today_date: date = daily_df.index[-1].date()
 
-    checks = CASCADE_CHECKS.get(cascade_step, [])
+    # --- Daily: all-levels independent evaluation (Fix 3) -------------------
+    median_vol = _compute_median_volume(daily_df, today_date, VOLUME_LOOKBACK_DAYS)
+    today_bar_volume = float(today_bar["volume"])
+    vol_ratio = today_bar_volume / median_vol if median_vol else 0.0
+    volume_ok = median_vol is not None and vol_ratio >= MOMENTUM_VOLUME_MULTIPLIER
+
+    qualifying_levels: list[tuple[int, float]] = []
+    for period in sorted(MA_PERIODS, reverse=True):
+        col = f"ma_{period}"
+        if col not in daily_df.columns:
+            continue
+        ma_val_raw = daily_df[col].iloc[-1]
+        if not _is_valid(ma_val_raw):
+            continue
+        ma_val = float(ma_val_raw)
+        wick_touched = today_low <= ma_val
+        closed_above = today_close > ma_val
+        if wick_touched and closed_above and volume_ok:
+            qualifying_levels.append((period, ma_val))
+
+    if qualifying_levels:
+        # Record a touch_log row per qualifying level so 3C accumulates
+        # correctly per MA, even though only one message is sent.
+        for period, _ in qualifying_levels:
+            db.record_touch(ticker, "D", period, today_date)
+
+        primary_period, primary_val = qualifying_levels[0]  # highest period first
+        also_touched = [
+            {"ma": f"D{period}", "value": val} for period, val in qualifying_levels[1:]
+        ]
+
+        touch_count = len(db.get_recent_touches(ticker, "D", primary_period, TOUCH_WINDOW_DAYS))
+        next_res = _next_resistance(
+            ticker, cascade_step, "D", primary_period,
+            daily_df, weekly_df, monthly_df, today_close,
+        )
+
+        daily_extra: dict = {
+            "touch_count": touch_count,
+            "next_resistance_ma": next_res[0] if next_res else None,
+            "next_resistance_value": next_res[1] if next_res else None,
+            "bar_low": today_low,
+            "also_touched": also_touched,
+        }
+
+        daily_alert = build_alert(
+            ticker=ticker,
+            signal_type="MA_SUPPORT",
+            timeframe="D",
+            ma_period=primary_period,
+            price=today_close,
+            ma_value=primary_val,
+            extra=daily_extra,
+            volume_ratio=vol_ratio,
+            bar_date=today_date,
+        )
+        alerts.append(daily_alert)
+        logger.info(
+            "%s fired for %s D%d @ %.4f (also touched: %s)",
+            label_for("3a"), ticker, primary_period, today_close,
+            ", ".join(f"D{p}" for p, _ in qualifying_levels[1:]) or "none",
+        )
+
+    # --- Weekly / Monthly: unchanged proximity-winner behavior --------------
+    checks = [(tf, period) for tf, period in CASCADE_CHECKS.get(cascade_step, []) if tf != "D"]
 
     # Group checks by timeframe
     by_tf: dict[str, list[int]] = {}
@@ -246,15 +321,12 @@ def detect_3a_ma_support(
         if df.empty:
             continue
 
-        # For W/M, restrict to completed (closed) bars only.
-        # An in-progress week/month must not be evaluated as a confirmed signal.
-        if tf != "D":
-            eval_df = df[df.index.date < today_date]
-            if eval_df.empty:
-                logger.debug("3A: no completed %s bars for %s", tf, ticker)
-                continue
-        else:
-            eval_df = df
+        # Restrict to completed (closed) bars only — an in-progress week/month
+        # must not be evaluated as a confirmed signal.
+        eval_df = df[df.index.date < today_date]
+        if eval_df.empty:
+            logger.debug("3A: no completed %s bars for %s", tf, ticker)
+            continue
 
         winner_period = _get_proximity_winner(tf, periods, eval_df, today_close)
         if winner_period is None:
@@ -265,44 +337,37 @@ def detect_3a_ma_support(
             continue
         ma_val = float(ma_val_raw)
 
-        # Bar to evaluate for wick/close conditions:
-        # D  → today's daily bar.
-        # W/M → last completed bar (strictly before today).
-        if tf == "D":
-            bar_low = today_low
-            bar_close = today_close
-            touch_date = today_date
-            bar_volume = float(today_bar["volume"])
-        else:  # W or M
-            bar = _latest_completed_bar(df, today_date)
-            if bar is None:
-                continue
-            bar_low = float(bar["low"])
-            bar_close = float(bar["close"])
-            touch_date = bar.name.date()
-            # Volume confirmation for W/M uses today's DAILY bar and daily median.
-            # The completed W/M bar defines the wick/close; today's session volume
-            # confirms that price is actively finding support at the level right now.
-            bar_volume = float(today_bar["volume"])
+        # Bar to evaluate for wick/close conditions: last completed bar
+        # (strictly before today).
+        bar = _latest_completed_bar(df, today_date)
+        if bar is None:
+            continue
+        bar_low = float(bar["low"])
+        bar_close = float(bar["close"])
+        touch_date = bar.name.date()
+        # Volume confirmation uses today's DAILY bar and daily median. The
+        # completed W/M bar defines the wick/close; today's session volume
+        # confirms that price is actively finding support at the level right now.
+        bar_volume = float(today_bar["volume"])
 
-            # W/M bar gate: suppress if this completed bar already fired a signal.
-            # Prevents the detector re-firing every daily scan while conditions hold.
-            last_bar = db.get_last_fired_bar_date(ticker, tf, winner_period, "MA_SUPPORT")
-            if last_bar is not None and touch_date <= last_bar:
-                logger.debug(
-                    "3A W/M gate: skip %s %s%d — bar %s already fired (last_bar=%s)",
-                    ticker, tf, winner_period, touch_date, last_bar,
-                )
-                continue
+        # W/M bar gate: suppress if this completed bar already fired a signal.
+        # Prevents the detector re-firing every daily scan while conditions hold.
+        last_bar = db.get_last_fired_bar_date(ticker, tf, winner_period, "MA_SUPPORT")
+        if last_bar is not None and touch_date <= last_bar:
+            logger.debug(
+                "3A W/M gate: skip %s %s%d — bar %s already fired (last_bar=%s)",
+                ticker, tf, winner_period, touch_date, last_bar,
+            )
+            continue
 
         # Wick condition: bar low ≤ MA value
         wick_touched = bar_low <= ma_val
         # Close condition: bar close > MA value
         closed_above = bar_close > ma_val
         # Volume condition: always use daily_df median (today's session confirms the touch).
-        median_vol = _compute_median_volume(daily_df, today_date, VOLUME_LOOKBACK_DAYS)
-        vol_ratio = bar_volume / median_vol if median_vol else 0.0
-        volume_ok = median_vol is not None and vol_ratio >= MOMENTUM_VOLUME_MULTIPLIER
+        median_vol_wm = _compute_median_volume(daily_df, today_date, VOLUME_LOOKBACK_DAYS)
+        vol_ratio = bar_volume / median_vol_wm if median_vol_wm else 0.0
+        volume_ok = median_vol_wm is not None and vol_ratio >= MOMENTUM_VOLUME_MULTIPLIER
 
         if not (wick_touched and closed_above and volume_ok):
             logger.debug(
@@ -311,7 +376,7 @@ def detect_3a_ma_support(
             )
             continue
 
-        # All conditions met — record touch (using bar's own date for W/M) and emit alert
+        # All conditions met — record touch (using bar's own date) and emit alert
         db.record_touch(ticker, tf, winner_period, touch_date)
 
         touch_count = len(db.get_recent_touches(ticker, tf, winner_period, TOUCH_WINDOW_DAYS))
@@ -381,6 +446,10 @@ def _detect_3b_for_timeframe(
     For W/M timeframes, each completed bar is counted at most once (guarded by
     last_bar_date in reclaim_tracker). For Daily, every calendar day of scan is
     a new bar so the guard is not needed but is harmless.
+
+    Fix 4 (Bug 4): streak counting uses closes only — intraday wicks touching
+    or piercing the MA never reset the streak (see the `bar_close > ma_val`
+    branch below; `bar_low`/wick values are never read here).
 
     Returns an alert dict when the streak reaches required_streak, else None.
     """
@@ -462,6 +531,26 @@ def _detect_3b_for_timeframe(
             break_date_raw = tracker.get("last_break_date")
             break_date_iso = break_date_raw if break_date_raw else None
             first_reclaim_date_iso = streak_start.isoformat() if streak_start else None
+
+            # Fix 5 (Bug 5): live trend-status string, computed only for Daily
+            # (the only timeframe cascade steps/STEP_LABELS describe). Built
+            # from this bar's own MA_PERIODS columns — the same live data the
+            # runner uses for today_daily_mas — so it can never contradict the
+            # numbers in this same alert. "new_step" below is the OLD fixed
+            # N-1 de-escalation rule; for Daily, runner._process_ticker()
+            # overwrites it with the Option-B-derived step (from
+            # determine_step_from_close) before dispatch. Left as-is here for
+            # W/M (which never de-escalates and never renders a state_line).
+            trend_status_str = None
+            if timeframe == "D":
+                from src.labels import trend_status as _trend_status
+                daily_mas = {
+                    p: (None if math.isnan(bar[f"ma_{p}"]) else float(bar[f"ma_{p}"]))
+                    for p in MA_PERIODS
+                    if f"ma_{p}" in bar.index
+                }
+                trend_status_str = _trend_status(bar_close, daily_mas)
+
             alert = build_alert(
                 ticker=ticker,
                 signal_type="RECLAIM",
@@ -475,6 +564,7 @@ def _detect_3b_for_timeframe(
                     "new_step": max(1, current_step - 1),
                     "break_date": break_date_iso,
                     "first_reclaim_date": first_reclaim_date_iso,
+                    "trend_status": trend_status_str,
                 },
                 volume_ratio=None,
                 bar_date=bar_date_val,
@@ -637,27 +727,64 @@ def detect_3c_touch_accumulation(
     today_close = float(daily_df.iloc[-1]["close"])
     today_date: date = daily_df.index[-1].date()
 
-    checks = CASCADE_CHECKS.get(cascade_step, [])
+    alerts: list[dict] = []
+
+    # --- Daily: all-levels independent evaluation (Fix 3, mirrors 3A) -------
+    # Each of D50/D100/D150/D200 (MA_PERIODS) is checked independently rather
+    # than restricting to the single cascade-step proximity winner, so touch
+    # accumulation on a level that isn't this step's "primary" MA is still
+    # detected (3A already records a touch_log row per qualifying level).
+    _n = min(15, len(daily_df))
+    trading_cutoff = daily_df.index[-_n].date()
+    for period in sorted(MA_PERIODS, reverse=True):
+        col = f"ma_{period}"
+        if col not in daily_df.columns:
+            continue
+        ma_val_raw = daily_df[col].iloc[-1]
+        if not _is_valid(ma_val_raw):
+            continue
+        ma_val = float(ma_val_raw)
+
+        recent_touches = db.get_touches_since(ticker, "D", period, trading_cutoff)
+        count = len(recent_touches)
+        if count >= TOUCH_THRESHOLD:
+            touch_date_strs = [d.isoformat() for d in sorted(recent_touches)[-TOUCH_THRESHOLD:]]
+            alert = build_alert(
+                ticker=ticker,
+                signal_type="TOUCH_ACCUMULATION",
+                timeframe="D",
+                ma_period=period,
+                price=today_close,
+                ma_value=ma_val,
+                extra={
+                    "touch_count": count,
+                    "touch_dates": touch_date_strs,
+                },
+                volume_ratio=None,
+                bar_date=today_date,
+            )
+            alerts.append(alert)
+            logger.info(
+                "%s fired for %s D%d — %d touches in window", label_for("3c"), ticker, period, count
+            )
+
+    # --- Weekly / Monthly: unchanged proximity-winner behavior --------------
+    checks = [(tf, period) for tf, period in CASCADE_CHECKS.get(cascade_step, []) if tf != "D"]
 
     # Group by timeframe for proximity rule
     by_tf: dict[str, list[int]] = {}
     for tf, period in checks:
         by_tf.setdefault(tf, []).append(period)
 
-    alerts: list[dict] = []
-
     for tf, periods in by_tf.items():
         df = _get_timeframe_df(tf, daily_df, weekly_df, monthly_df)
         if df.empty:
             continue
 
-        # For W/M, restrict to completed bars (same rule as 3A)
-        if tf != "D":
-            eval_df = df[df.index.date < today_date]
-            if eval_df.empty:
-                continue
-        else:
-            eval_df = df
+        # Restrict to completed bars (same rule as 3A) — this loop is W/M only.
+        eval_df = df[df.index.date < today_date]
+        if eval_df.empty:
+            continue
 
         winner_period = _get_proximity_winner(tf, periods, eval_df, today_close)
         if winner_period is None:
@@ -668,27 +795,21 @@ def detect_3c_touch_accumulation(
             continue
         ma_val = float(ma_val_raw)
 
-        # Bar date for this signal: last completed bar for W/M, today for D.
-        if tf != "D":
-            current_bar_date = eval_df.index[-1].date()
-        else:
-            current_bar_date = today_date
+        # Bar date for this signal: last completed bar.
+        current_bar_date = eval_df.index[-1].date()
 
         # W/M bar gate: suppress if this completed bar already fired a 3C signal.
-        if tf in ("W", "M"):
-            last_bar = db.get_last_fired_bar_date(ticker, tf, winner_period, "TOUCH_ACCUMULATION")
-            if last_bar is not None and current_bar_date <= last_bar:
-                logger.debug(
-                    "3C W/M gate: skip %s %s%d — bar %s already fired (last_bar=%s)",
-                    ticker, tf, winner_period, current_bar_date, last_bar,
-                )
-                continue
+        last_bar = db.get_last_fired_bar_date(ticker, tf, winner_period, "TOUCH_ACCUMULATION")
+        if last_bar is not None and current_bar_date <= last_bar:
+            logger.debug(
+                "3C W/M gate: skip %s %s%d — bar %s already fired (last_bar=%s)",
+                ticker, tf, winner_period, current_bar_date, last_bar,
+            )
+            continue
 
         # 15-trading-day window: 15th-from-last row in daily_df is the cutoff.
         # daily_df is indexed by contiguous trading days, so this is exact —
         # no calendar-day approximation, no holiday drift.
-        _n = min(15, len(daily_df))
-        trading_cutoff = daily_df.index[-_n].date()
         recent_touches = db.get_touches_since(ticker, tf, winner_period, trading_cutoff)
         count = len(recent_touches)
 

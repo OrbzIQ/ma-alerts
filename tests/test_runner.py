@@ -175,3 +175,221 @@ class TestCheckAndRepairOhlcvDrift:
 
         assert result is True  # still signals "handled" so caller doesn't double-upsert
         mock_fetch.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Fix 6 -- last_break_date recorded on forward transition
+# ---------------------------------------------------------------------------
+
+class TestFix6BreakDateOnForwardTransition:
+
+    def test_forward_transition_records_last_break_date_same_day(self):
+        """
+        Fix 6 (Bug 6): on the day a Daily MA actually breaks, 3B is skipped
+        (forward transition fires instead), so reclaim_tracker.last_break_date
+        was previously never written for a break-and-bounce -- it stayed
+        null forever. runner._process_ticker() must now record it directly
+        inside the `if transition:` branch, using that day's bar date.
+        """
+        import pandas as pd
+        import src.db as db
+        from datetime import date, timedelta
+        from src.runner import _process_ticker
+
+        n_seed = 259
+        end_seed = pd.Timestamp(date.today() - timedelta(days=1))
+        seed_dates = pd.bdate_range(end=end_seed, periods=n_seed)
+        # Mild uptrend so today's close currently sits above D50 (step 1).
+        seed_closes = [200.0 + i * 0.05 for i in range(n_seed)]
+        seed_candles = [
+            _candle(d.date().isoformat(), c) for d, c in zip(seed_dates, seed_closes)
+        ]
+        db.upsert_ohlcv("TEST", seed_candles)
+
+        # New day: close crashes well below D50 (and every other Daily MA) --
+        # a clean forward transition from step 1 to some deeper step.
+        new_date = pd.bdate_range(start=seed_dates[-1] + pd.Timedelta(days=1), periods=1)[0]
+        # Fetch mock returns the tail of the seed (unchanged, so no drift is
+        # detected) plus the new crashing bar.
+        tail = seed_candles[-29:]
+        new_candle = _candle(new_date.date().isoformat(), 100.0)
+        fetched = tail + [new_candle]
+
+        with mock.patch("src.fetcher.fetch_daily_ohlcv", return_value=fetched):
+            alerts = _process_ticker("TEST", "US")
+
+        assert isinstance(alerts, list)
+
+        state = db.get_cascade_state("TEST")
+        assert state["current_step"] > 1, "a forward transition must have fired"
+
+        broken_period = int(state["broken_ma"].lstrip("D"))
+        row = db.get_reclaim_streak_full("TEST", "D", broken_period)
+        assert row["last_break_date"] == new_date.date().isoformat(), (
+            "last_break_date must be recorded on the transition day itself, "
+            "not left null for a later scan to fill in"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix 5 Option B -- reclaim de-escalation derives the new step live
+# ---------------------------------------------------------------------------
+
+class TestFix5OptionBReclaimDerivation:
+
+    def test_reclaim_derives_step_from_live_close_not_fixed_n_minus_1(self):
+        """
+        Fix 5 Option B (locked 2026-07-19): after a Daily 3B confirmation,
+        the new cascade step must come from determine_step_from_close() on
+        that day's close/MAs -- not the old fixed N-1 rule. This test forces
+        a reclaim of D200 (pre-reclaim step 5) on a bar whose close is so far
+        above every Daily MA that the correct derived state is step 1, which
+        the old fixed rule (N-1 = step 4) could never produce -- proving the
+        runner actually re-derives rather than just decrementing by one.
+        """
+        import pandas as pd
+        import src.db as db
+        from datetime import date, timedelta
+        from src.runner import _process_ticker
+
+        n_seed = 259
+        end_seed = pd.Timestamp(date.today() - timedelta(days=1))
+        seed_dates = pd.bdate_range(end=end_seed, periods=n_seed)
+        # Flat history -> all Daily MAs converge to ~100.
+        seed_candles = [_candle(d.date().isoformat(), 100.0) for d in seed_dates]
+        db.upsert_ohlcv("TEST", seed_candles)
+
+        # Pre-existing state: step 5, broken D200, streak at 6/7 (one bar from firing).
+        db.set_cascade_state("TEST", 5, "D200")
+        db.set_reclaim_streak(
+            "TEST", "D", 200, 6, seed_dates[-1].date() - timedelta(days=6),
+            last_bar_date=seed_dates[-1].date() - timedelta(days=1),
+            was_broken=0,
+        )
+
+        new_date = pd.bdate_range(start=seed_dates[-1] + pd.Timedelta(days=1), periods=1)[0]
+        tail = seed_candles[-29:]
+        # New close is far above every Daily MA (which are all still ~100) --
+        # the 7th consecutive close above D200, AND high enough that the
+        # live position is actually step 1, not just-reclaimed-step-4.
+        new_candle = _candle(new_date.date().isoformat(), 150.0)
+        fetched = tail + [new_candle]
+
+        with mock.patch("src.fetcher.fetch_daily_ohlcv", return_value=fetched):
+            alerts = _process_ticker("TEST", "US")
+
+        reclaim_alerts = [a for a in alerts if a.get("signal_type") == "RECLAIM" and a.get("timeframe") == "D"]
+        assert len(reclaim_alerts) == 1, "the 7th consecutive close above D200 must confirm the reclaim"
+
+        state = db.get_cascade_state("TEST")
+        assert state["current_step"] == 1, (
+            "Option B must derive the live step from close vs today's MAs "
+            "(step 1 here), not the old fixed N-1 rule (which would give step 4)"
+        )
+        assert state["broken_ma"] == "NONE"
+        assert reclaim_alerts[0]["extra"]["new_step"] == 1, (
+            "the alert's new_step must reflect the derived post-reclaim state, "
+            "not the pre-derivation N-1 value computed inside _detect_3b_for_timeframe"
+        )
+
+    def test_anomaly_guard_keeps_state_when_derived_step_not_shallower(self):
+        """
+        Option B guard: if determine_step_from_close ever returns a step that
+        is not strictly shallower than the pre-reclaim step, the runner must
+        keep the current cascade state unchanged rather than apply a bogus
+        de-escalation. This can't be reached through ordinary price action
+        (the same bar-close/MA values that let 3B fire a RECLAIM in the first
+        place also feed determine_step_from_close, and if that derivation
+        came out >= the pre-reclaim step, runner's own forward-transition
+        check earlier in the pipeline would already have fired instead of
+        letting the reclaim path run at all). It's a defensive guard against
+        a genuinely anomalous/inconsistent input -- tested here by forcing
+        the derivation directly.
+        """
+        import pandas as pd
+        import src.db as db
+        from datetime import date, timedelta
+        from src.runner import _process_ticker
+
+        n_seed = 259
+        end_seed = pd.Timestamp(date.today() - timedelta(days=1))
+        seed_dates = pd.bdate_range(end=end_seed, periods=n_seed)
+        seed_closes = [200.0 + i * 0.05 for i in range(n_seed)]
+        seed_candles = [_candle(d.date().isoformat(), c) for d, c in zip(seed_dates, seed_closes)]
+        db.upsert_ohlcv("TEST", seed_candles)
+
+        db.set_cascade_state("TEST", 2, "D50")
+        db.set_reclaim_streak(
+            "TEST", "D", 50, 6, seed_dates[-1].date() - timedelta(days=6),
+            last_bar_date=seed_dates[-1].date() - timedelta(days=1),
+            was_broken=0,
+        )
+
+        new_date = pd.bdate_range(start=seed_dates[-1] + pd.Timedelta(days=1), periods=1)[0]
+        tail = seed_candles[-29:]
+        # A clean close above every Daily MA -- confirms the reclaim (7th
+        # consecutive close above D50) and would ordinarily derive step 1.
+        new_candle = _candle(new_date.date().isoformat(), 250.0)
+        fetched = tail + [new_candle]
+
+        # Force the derivation to claim "no improvement" (still step 2) so
+        # the guard's condition (derived_step >= pre_reclaim_step) is hit
+        # regardless of what the real MA math would have said.
+        with mock.patch("src.fetcher.fetch_daily_ohlcv", return_value=fetched), \
+             mock.patch("src.cascade.determine_step_from_close", return_value=(2, "D50")), \
+             mock.patch("src.alerter.send_ops_message") as mock_ops:
+            alerts = _process_ticker("TEST", "US")
+
+        reclaim_alerts = [a for a in alerts if a.get("signal_type") == "RECLAIM" and a.get("timeframe") == "D"]
+        assert len(reclaim_alerts) == 1, "the 7th consecutive close above D50 must still confirm the reclaim"
+
+        state = db.get_cascade_state("TEST")
+        assert state["current_step"] == 2, "anomaly guard must leave the pre-reclaim state unchanged"
+        assert state["broken_ma"] == "D50"
+        mock_ops.assert_called_once()
+        assert "anomaly" in mock_ops.call_args[0][0].lower()
+        assert reclaim_alerts[0]["extra"]["new_step"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Fix 2a -- main_rebaseline_all
+# ---------------------------------------------------------------------------
+
+class TestMainRebaselineAll:
+
+    def test_rebaselines_every_active_watchlist_ticker(self):
+        import src.db as db
+        from src.runner import main_rebaseline_all
+
+        db.add_watchlist_ticker("AAA", "US")
+        db.add_watchlist_ticker("BBB", "US")
+        # TEST is already added by the isolated_db fixture.
+
+        with mock.patch("src.runner.main_rebaseline", return_value=0) as mock_rebaseline, \
+             mock.patch.dict(os.environ, {
+                 "TWELVE_DATA_API_KEY": "x", "TURSO_DATABASE_URL": "file:x",
+                 "TURSO_AUTH_TOKEN": "x", "TELEGRAM_BOT_TOKEN": "x", "TELEGRAM_CHAT_ID": "x",
+             }):
+            result = main_rebaseline_all()
+
+        assert result == 0
+        mock_rebaseline.assert_called_once()
+        called_tickers = set(mock_rebaseline.call_args[0][0])
+        assert called_tickers == {"AAA", "BBB", "TEST"}
+
+    def test_empty_watchlist_is_a_no_op(self):
+        import src.db as db
+        from src.runner import main_rebaseline_all
+
+        # Deactivate the fixture-created TEST ticker so the watchlist is empty.
+        db._db().execute("UPDATE watchlist SET active = 0 WHERE ticker = 'TEST'")
+
+        with mock.patch("src.runner.main_rebaseline") as mock_rebaseline, \
+             mock.patch.dict(os.environ, {
+                 "TWELVE_DATA_API_KEY": "x", "TURSO_DATABASE_URL": "file:x",
+                 "TURSO_AUTH_TOKEN": "x", "TELEGRAM_BOT_TOKEN": "x", "TELEGRAM_CHAT_ID": "x",
+             }):
+            result = main_rebaseline_all()
+
+        assert result == 0
+        mock_rebaseline.assert_not_called()

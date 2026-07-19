@@ -17,6 +17,8 @@ Pipeline per run:
           3B is skipped if a forward transition fired this run
           3D is stateless — runs unconditionally after cascade state is final
        i. Collect alerts
+  4-bis. Fix 2b: rotating deep drift audit (K tickers/day, outputsize=250) —
+         closes the 30-bar blind spot in step 4's incremental drift check.
   5. Collect halt warnings
   6. Dispatch all alerts
   7. Persist to alert_log
@@ -27,6 +29,8 @@ Usage:
     python -m src.runner --market US
     python -m src.runner --market SG
     python -m src.runner --market US --test-telegram
+    python -m src.runner --rebaseline AAPL,MSFT
+    python -m src.runner --rebaseline-all
 """
 
 from __future__ import annotations
@@ -219,6 +223,66 @@ def _check_and_repair_ohlcv_drift(ticker: str, market: str, candles: list[dict])
 
 
 # ---------------------------------------------------------------------------
+# Fix 2b: rotating deep drift audit
+# ---------------------------------------------------------------------------
+
+def _run_deep_drift_audit() -> None:
+    """
+    Each scan, re-check the K=DEEP_AUDIT_TICKERS_PER_DAY tickers with the
+    oldest last_deep_audit using a much wider fetch (outputsize=
+    DEEP_AUDIT_OUTPUTSIZE) than the normal 30-bar incremental fetch, reusing
+    _check_and_repair_ohlcv_drift's existing close-comparison-and-repair
+    logic unchanged. This closes the structural blind spot in the regular
+    A2 check: a basis discontinuity older than 30 bars is invisible to it,
+    but still corrupts every 50-200 bar MA that spans the boundary.
+
+    Never raises — a failure for one ticker (or the whole audit) is logged
+    and does not abort the run; this is a background maintenance pass, not
+    part of the critical scan path.
+
+    last_deep_audit is only advanced on a successful fetch, so a transient
+    fetch failure leaves the ticker "due" and it will be retried on the next
+    run rather than silently skipping its turn in the rotation.
+    """
+    import src.db as db
+    from src.config import DEEP_AUDIT_OUTPUTSIZE, DEEP_AUDIT_TICKERS_PER_DAY
+    from src.fetcher import fetch_daily_ohlcv
+
+    try:
+        due_tickers = db.get_tickers_for_deep_audit(DEEP_AUDIT_TICKERS_PER_DAY)
+    except Exception as exc:
+        logger.error("Deep drift audit: failed to select tickers: %s", exc)
+        return
+
+    if not due_tickers:
+        return
+
+    market_by_ticker = {e["ticker"]: e["market"] for e in db.get_watchlist(market=None)}
+
+    for ticker in due_tickers:
+        ticker_market = market_by_ticker.get(ticker)
+        if ticker_market is None:
+            logger.warning("Deep drift audit: %s not found in watchlist — skipping", ticker)
+            continue
+        try:
+            logger.info(
+                "Deep drift audit: checking %s (%s) with outputsize=%d",
+                ticker, ticker_market, DEEP_AUDIT_OUTPUTSIZE,
+            )
+            candles = fetch_daily_ohlcv(ticker, ticker_market, outputsize=DEEP_AUDIT_OUTPUTSIZE)
+            if not candles:
+                logger.warning(
+                    "Deep drift audit: no candles returned for %s — leaving "
+                    "last_deep_audit unchanged, will retry next run", ticker,
+                )
+                continue
+            _check_and_repair_ohlcv_drift(ticker, ticker_market, candles)
+            db.set_deep_audit_date(ticker, date.today())
+        except Exception as exc:
+            logger.error("Deep drift audit failed for %s: %s", ticker, exc)
+
+
+# ---------------------------------------------------------------------------
 # Per-ticker processing
 # ---------------------------------------------------------------------------
 
@@ -230,7 +294,7 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
     Exceptions are caught and logged — never propagates.
     """
     import src.db as db
-    from src.cascade import apply_reclaim_de_escalation, detect_forward_transition
+    from src.cascade import detect_forward_transition, determine_step_from_close
     from src.config import MA_PERIODS, MA_PERIODS_DAILY, OHLCV_RETENTION_YEARS
     from src.fetcher import fetch_daily_ohlcv
     from src.health import update_after_fetch
@@ -333,7 +397,15 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
             db.set_cascade_state(ticker, transition["to_step"], transition["broken_ma"])
             # Clear stale reclaim streak for the newly broken MA
             old_ma_period = int(transition["broken_ma"].lstrip("D"))
-            db.set_reclaim_streak(ticker, "D", old_ma_period, 0, None)
+            # Fix 6: record the break date at the moment it happens. 3B
+            # (_detect_3b_for_timeframe) is skipped entirely on a transition
+            # day, so last_break_date would otherwise stay null forever for
+            # a break-and-bounce (price closes back above before any later
+            # scan observes the close <= MA branch that normally sets it).
+            db.set_reclaim_streak(
+                ticker, "D", old_ma_period, 0, None,
+                last_break_date=daily_df.index[-1].date(),
+            )
             # Reload updated state
             cascade_state = db.get_cascade_state(ticker)
             logger.info(
@@ -376,15 +448,57 @@ def _process_ticker(ticker: str, market: str) -> list[dict]:
                 ticker, daily_df, weekly_df, monthly_df, cascade_state, cascade_step
             )
             for reclaim_alert in reclaim_alerts:
-                # Only Daily reclaim triggers cascade de-escalation
+                # Only Daily reclaim triggers cascade de-escalation.
+                #
+                # Fix 5 Option B (locked 2026-07-19): the post-reclaim step is
+                # now DERIVED from today's close vs today's Daily MAs via
+                # determine_step_from_close() — the same live comparison the
+                # forward-transition path already uses — instead of the old
+                # fixed N-1 rule (cascade.apply_reclaim_de_escalation, now
+                # unused here; kept for tests/compat). The 7-close
+                # confirmation gate in _detect_3b_for_timeframe is unchanged
+                # and remains the sole anti-whipsaw gate before any downward
+                # move — this only changes WHAT the new state is, not WHEN
+                # a reclaim is allowed to fire.
+                #
+                # Guard: a reclaim can never legitimately result in a step
+                # that is >= the pre-reclaim step (that would mean the
+                # "reclaim" made things worse or unchanged, which is a data
+                # anomaly, not a valid de-escalation) — keep the current
+                # state, log a warning, and send one [OPS] note instead.
                 if reclaim_alert.get("timeframe") == "D":
-                    de_escalation = apply_reclaim_de_escalation(ticker, cascade_state)
-                    if de_escalation:
-                        db.set_cascade_state(
-                            ticker,
-                            de_escalation["new_step"],
-                            de_escalation["new_broken_ma"],
+                    pre_reclaim_step = cascade_state.get("current_step", 1)
+                    derived_step, derived_broken_ma = determine_step_from_close(
+                        today_close, today_daily_mas
+                    )
+                    if derived_step >= pre_reclaim_step:
+                        logger.warning(
+                            "Reclaim de-escalation anomaly for %s: derived step "
+                            "%d is not shallower than pre-reclaim step %d — "
+                            "keeping current cascade state unchanged",
+                            ticker, derived_step, pre_reclaim_step,
                         )
+                        try:
+                            from src.alerter import send_ops_message
+                            send_ops_message(
+                                f"Reclaim de-escalation anomaly for {ticker}: "
+                                f"derived step {derived_step} >= pre-reclaim step "
+                                f"{pre_reclaim_step} — state left unchanged"
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Failed to send de-escalation anomaly ops alert for %s: %s",
+                                ticker, exc,
+                            )
+                        reclaim_alert["extra"]["new_step"] = pre_reclaim_step
+                    else:
+                        db.set_cascade_state(ticker, derived_step, derived_broken_ma)
+                        cascade_state = db.get_cascade_state(ticker)
+                        # The alert's new_step must reflect the derived
+                        # post-reclaim state (previous_step/new_step were
+                        # computed inside _detect_3b_for_timeframe before
+                        # this re-derivation ran).
+                        reclaim_alert["extra"]["new_step"] = derived_step
                 alerts.append(reclaim_alert)
 
         # 3D: stateless, runs unconditionally; receives post-transition cascade_step
@@ -477,6 +591,14 @@ def main(market: str) -> int:
                 f"All per-ticker iterations failed. Check run logs.\n"
                 f"UTC: {_ts}"
             )
+
+        # 4-bis. Fix 2b: rotating deep drift audit (K tickers/day, outputsize=250).
+        # Runs after the main per-ticker loop so a repair triggered here doesn't
+        # reorder this run's own alert detection; it takes effect starting next run.
+        try:
+            _run_deep_drift_audit()
+        except Exception as exc:
+            logger.error("Deep drift audit step failed (non-fatal): %s", exc)
 
         # 5. Halt warnings
         halt_warnings = check_and_warn_halts()
@@ -601,6 +723,54 @@ def main_rebaseline(tickers: list[str]) -> int:
     return 0 if not failures else 1
 
 
+def main_rebaseline_all() -> int:
+    """
+    Fix 2a — full-watchlist rebaseline (one-off remediation).
+
+    Forces the A2 OHLCV repair path (see main_rebaseline) for EVERY active
+    watchlist ticker across all markets, not just a named subset. This is
+    the maintenance entry point Gate A's diagnosis calls for: Session 6
+    rebaselined only 4 tickers (APH, ANET, GOOG, V) after fixing the fetcher's
+    `adjust` pinning; the rest of the watchlist (~38 more tickers) still
+    carries pre-fix, mixed-basis history deep enough to corrupt 50-200 bar
+    MAs while the 30-bar A2 drift guard stays blind to it.
+
+    Manually triggered only (CLI flag / workflow_dispatch input) — never on
+    a cron schedule. Budget: ~2 Twelve Data credits per ticker (one full
+    history fetch in this function + one more inside bootstrap_ticker's own
+    re-fetch), comfortably inside the 800/day quota for a watchlist of this
+    size, paced by the existing fetcher rate limiter (respects the
+    8-calls/minute floor automatically — no additional sleep needed here).
+
+    Returns exit code: 0 if every ticker rebaselined successfully, 1 if any
+    failed (per-ticker failures are logged and included in the final [OPS]
+    summary; the batch is not aborted early).
+    """
+    import src.db as db
+
+    try:
+        _check_env()
+    except RuntimeError as exc:
+        logger.critical("%s", exc)
+        return _fail_and_alert(str(exc))
+
+    try:
+        db.init_schema()
+    except Exception as exc:
+        logger.critical("Schema init failed: %s", exc)
+        return _fail_and_alert(f"schema init failed: {exc}")
+
+    all_entries = db.get_watchlist(market=None)
+    all_tickers = [e["ticker"] for e in all_entries]
+
+    if not all_tickers:
+        logger.warning("--rebaseline-all: watchlist is empty — nothing to do")
+        return 0
+
+    logger.info("--rebaseline-all: rebaselining %d ticker(s)", len(all_tickers))
+    return main_rebaseline(all_tickers)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -629,11 +799,29 @@ if __name__ == "__main__":
             "(comma-separated), then exit. Mutually exclusive with a normal scan."
         ),
     )
+    parser.add_argument(
+        "--rebaseline-all",
+        action="store_true",
+        help=(
+            "Fix 2a: force the A2 OHLCV data-basis repair path for EVERY active "
+            "watchlist ticker (all markets), then exit. One-off remediation — "
+            "manually triggered only, never on cron. Mutually exclusive with "
+            "--market and --rebaseline."
+        ),
+    )
     args = parser.parse_args()
 
     if args.test_telegram:
         from src.alerter import send_test_ping
         sys.exit(0 if send_test_ping() else 1)
+
+    if args.rebaseline_all:
+        if args.market or args.rebaseline:
+            parser.error(
+                "--rebaseline-all cannot be combined with --market or --rebaseline "
+                "(mutually exclusive)"
+            )
+        sys.exit(main_rebaseline_all())
 
     if args.rebaseline:
         if args.market:
@@ -644,6 +832,6 @@ if __name__ == "__main__":
         sys.exit(main_rebaseline(_tickers))
 
     if not args.market:
-        parser.error("--market is required when not using --test-telegram or --rebaseline")
+        parser.error("--market is required when not using --test-telegram, --rebaseline, or --rebaseline-all")
 
     sys.exit(main(args.market))

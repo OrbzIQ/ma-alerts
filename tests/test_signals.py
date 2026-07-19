@@ -169,6 +169,50 @@ class TestDetect3AMaSupport:
         alerts = self._run(df, cascade_step=1)
         assert isinstance(alerts, list)
 
+    def test_fix3_wick_spanning_two_mas_fires_one_consolidated_alert(self):
+        """
+        Fix 3 (Bug 3): a Daily wick spanning multiple stacked MAs (here D50
+        and D100) must qualify at BOTH levels independently -- one touch_log
+        row per level -- while only ONE Telegram message/alert dict is
+        emitted, with the secondary level(s) listed in extra.also_touched.
+        This is the CLS-class case the old single-winner-per-timeframe design
+        (CASCADE_CHECKS + _get_proximity_winner) could never produce.
+        """
+        import src.db as db
+
+        df = _make_daily_df(n=250, base_close=100.0, trend=0.05, volume=3_000_000)
+        _add_mas(df, (50, 100, 150, 200))
+        ma50 = float(df["ma_50"].iloc[-1])
+        ma100 = float(df["ma_100"].iloc[-1])
+        assert ma50 > ma100, "uptrend fixture must produce ma_50 > ma_100 for this test to be valid"
+
+        # Wick touches both D50 and D100 (low below the lower of the two);
+        # closes above both (close above the higher of the two).
+        df.iloc[-1, df.columns.get_loc("low")] = ma100 - 0.50
+        df.iloc[-1, df.columns.get_loc("close")] = ma50 + 1.00
+        df.iloc[-1, df.columns.get_loc("volume")] = 6_000_000
+
+        alerts = self._run(df, cascade_step=1)
+        daily_alerts = [a for a in alerts if a["timeframe"] == "D"]
+        assert len(daily_alerts) == 1, "must consolidate into exactly one Daily message"
+
+        alert = daily_alerts[0]
+        # Both D50 and D100 qualify here (D150/D200 don't -- the wick doesn't
+        # reach that low); "highest-period qualifying MA" among {50, 100} is
+        # 100, so D100 is primary and D50 is the secondary "also touched" level.
+        assert alert["ma_period"] == 100, "primary level must be the highest-period qualifying MA"
+
+        also_touched = alert["extra"]["also_touched"]
+        assert len(also_touched) == 1
+        assert also_touched[0]["ma"] == "D50"
+
+        # A touch_log row must exist per qualifying level, not just the primary.
+        today_date = df.index[-1].date()
+        touches_d50 = db.get_touches_since("TEST", "D", 50, today_date)
+        touches_d100 = db.get_touches_since("TEST", "D", 100, today_date)
+        assert today_date in touches_d50
+        assert today_date in touches_d100
+
 
 # ---------------------------------------------------------------------------
 # Signal 3B -- MA Reclaim
@@ -272,6 +316,30 @@ class TestDetect3BReclaim:
         assert row["consecutive_closes"] == 0
         assert row["streak_start"] is None
         assert row["was_broken"] == 0
+
+    def test_fix4_intraday_wick_below_ma_does_not_reset_streak(self):
+        """
+        Fix 4 (Bug 4): streak counting uses CLOSES ONLY. A bar whose low
+        pierces (or exactly touches) the MA intraday, but whose close is
+        still above it, must increment the streak like any other qualifying
+        close -- not reset it. _detect_3b_for_timeframe never reads bar_low
+        in the reclaim path; this is the NVDA-D100-class 7th-day wick case.
+        """
+        import src.db as db
+        df = _make_daily_df(n=60, base_close=210.0)
+        _add_mas(df, (50,))
+        ma_val = float(df["ma_50"].iloc[-1])
+        today = df.index[-1].date()
+        db.set_reclaim_streak("TEST", 50, 5, today - timedelta(days=5))
+
+        # Wick pierces well below the MA intraday, but the bar still closes above it.
+        df.iloc[-1, df.columns.get_loc("low")] = ma_val - 10.0
+        df.iloc[-1, df.columns.get_loc("close")] = ma_val + 2.0
+
+        result = self._run(df, _cascade_state())
+        # Streak must have incremented (5 -> 6), not reset to 0/1.
+        assert db.get_reclaim_streak("TEST", 50) == 6
+        assert result is None  # not yet at required_streak (7)
 
     def test_daily_evaluates_latest_bar_even_when_today_is_not_a_business_day(self):
         """

@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS data_health (
     last_success            DATE,
     consecutive_failures    INTEGER NOT NULL DEFAULT 0,
     last_warning_sent       DATE,
+    last_deep_audit         TEXT,                        -- Fix 2b: date of the last rotating deep drift audit (outputsize=250)
     FOREIGN KEY (ticker) REFERENCES watchlist(ticker)
 );
 
@@ -665,6 +666,43 @@ def _migrate_api_usage_v1() -> None:
         logger.error("api_usage migration failed: %s", exc)
 
 
+def _migrate_data_health_v2() -> None:
+    """
+    Fix 2b migration: add last_deep_audit TEXT column to data_health.
+
+    last_deep_audit records the date of the ticker's most recent rotating
+    deep drift audit (outputsize=250 comparison — see
+    runner._run_deep_drift_audit). Distinct from the A2 incremental drift
+    check (which only ever sees 30 bars), this closes that check's 30-bar
+    blind spot by rotating a widened comparison across the whole watchlist
+    over time (K=3 tickers/day; every ticker audited roughly every 3 weeks).
+
+    Idempotent: checks sqlite_master for the last_deep_audit column first.
+    """
+    try:
+        rows = _db().execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='data_health'"
+        )
+    except Exception as exc:
+        logger.warning("data_health V2 migration: sqlite_master read failed (%s) — skipping", exc)
+        return
+
+    if not rows:
+        return  # table doesn't exist yet; fresh _SCHEMA_SQL DDL creates it with last_deep_audit
+
+    table_sql: str = (rows[0].get("sql") or "")
+    if "last_deep_audit" in table_sql:
+        return  # already migrated
+
+    try:
+        _db().execute(
+            "ALTER TABLE data_health ADD COLUMN last_deep_audit TEXT"
+        )
+        logger.info("data_health V2 migration complete — last_deep_audit added")
+    except Exception as exc:
+        logger.error("data_health V2 migration failed: %s", exc)
+
+
 def init_schema() -> None:
     """
     Run DDL to create all tables and indexes. Idempotent — safe to call on every run.
@@ -676,6 +714,7 @@ def init_schema() -> None:
     _migrate_reclaim_tracker_v3()
     _migrate_reclaim_tracker_v4()
     _migrate_api_usage_v1()
+    _migrate_data_health_v2()
     logger.info("Schema initialised (or already up to date)")
 
 
@@ -1012,35 +1051,47 @@ def prune_old_touches(window_days: int) -> int:
 # ---------------------------------------------------------------------------
 
 def get_data_health(ticker: str) -> dict:
-    """Returns {'last_success': str|None, 'consecutive_failures': int, 'last_warning_sent': str|None}."""
+    """Returns {'last_success', 'consecutive_failures', 'last_warning_sent', 'last_deep_audit'}."""
     rows = _db().execute(
-        "SELECT last_success, consecutive_failures, last_warning_sent "
+        "SELECT last_success, consecutive_failures, last_warning_sent, last_deep_audit "
         "FROM data_health WHERE ticker = ?",
         [ticker],
     )
     if rows:
         return dict(rows[0])
-    return {"last_success": None, "consecutive_failures": 0, "last_warning_sent": None}
+    return {
+        "last_success": None,
+        "consecutive_failures": 0,
+        "last_warning_sent": None,
+        "last_deep_audit": None,
+    }
 
 
 def update_data_health(ticker: str, success: bool) -> None:
-    """On success: set last_success, reset failures to 0. On fail: increment failures."""
+    """On success: set last_success, reset failures to 0. On fail: increment failures.
+
+    Every branch here uses INSERT OR REPLACE, which overwrites the ENTIRE row —
+    so last_warning_sent and last_deep_audit must always be explicitly carried
+    forward from the existing row, or a plain fetch/failure update would
+    silently wipe out the halt-warning throttle and the Fix 2b deep-audit
+    rotation state.
+    """
     today = date.today().isoformat()
+    existing = get_data_health(ticker)
     if success:
         _db().execute(
-            "INSERT OR REPLACE INTO data_health (ticker, last_success, consecutive_failures, last_warning_sent) "
-            "VALUES (?, ?, 0, "
-            "  (SELECT last_warning_sent FROM data_health WHERE ticker = ?))",
-            [ticker, today, ticker],
+            "INSERT OR REPLACE INTO data_health "
+            "(ticker, last_success, consecutive_failures, last_warning_sent, last_deep_audit) "
+            "VALUES (?, ?, 0, ?, ?)",
+            [ticker, today, existing["last_warning_sent"], existing["last_deep_audit"]],
         )
     else:
-        existing = get_data_health(ticker)
         new_count = existing["consecutive_failures"] + 1
         _db().execute(
             "INSERT OR REPLACE INTO data_health "
-            "(ticker, last_success, consecutive_failures, last_warning_sent) "
-            "VALUES (?, ?, ?, ?)",
-            [ticker, existing["last_success"], new_count, existing["last_warning_sent"]],
+            "(ticker, last_success, consecutive_failures, last_warning_sent, last_deep_audit) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [ticker, existing["last_success"], new_count, existing["last_warning_sent"], existing["last_deep_audit"]],
         )
 
 
@@ -1050,10 +1101,50 @@ def mark_warning_sent(ticker: str) -> None:
     existing = get_data_health(ticker)
     _db().execute(
         "INSERT OR REPLACE INTO data_health "
-        "(ticker, last_success, consecutive_failures, last_warning_sent) "
-        "VALUES (?, ?, ?, ?)",
-        [ticker, existing["last_success"], existing["consecutive_failures"], today],
+        "(ticker, last_success, consecutive_failures, last_warning_sent, last_deep_audit) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [ticker, existing["last_success"], existing["consecutive_failures"], today, existing["last_deep_audit"]],
     )
+
+
+def set_deep_audit_date(ticker: str, audit_date: date) -> None:
+    """Fix 2b: record that `ticker` had a rotating deep drift audit on audit_date.
+
+    Preserves the rest of the data_health row (read-modify-write), same
+    reasoning as update_data_health/mark_warning_sent above.
+    """
+    existing = get_data_health(ticker)
+    _db().execute(
+        "INSERT OR REPLACE INTO data_health "
+        "(ticker, last_success, consecutive_failures, last_warning_sent, last_deep_audit) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            ticker,
+            existing["last_success"],
+            existing["consecutive_failures"],
+            existing["last_warning_sent"],
+            audit_date.isoformat(),
+        ],
+    )
+
+
+def get_tickers_for_deep_audit(k: int) -> list[str]:
+    """Fix 2b: return up to k active watchlist tickers due for a rotating deep audit.
+
+    Ordered by last_deep_audit ascending with NULLs first (a ticker that has
+    never been deep-audited is always more "due" than one audited on any
+    real date) — so every active ticker eventually rotates through, and new
+    tickers are prioritised on their first few runs.
+    """
+    rows = _db().execute(
+        "SELECT w.ticker AS ticker FROM watchlist w "
+        "LEFT JOIN data_health h ON h.ticker = w.ticker "
+        "WHERE w.active = 1 "
+        "ORDER BY (h.last_deep_audit IS NOT NULL), h.last_deep_audit ASC "
+        "LIMIT ?",
+        [k],
+    )
+    return [r["ticker"] for r in rows]
 
 
 # ---------------------------------------------------------------------------

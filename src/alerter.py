@@ -18,7 +18,7 @@ import requests
 from dotenv import load_dotenv
 
 import src.db as db
-from src.labels import label_for, step_label
+from src.labels import directional_breakthrough_label, label_for, step_label, trend_status
 from src.sanity import check_alert
 
 load_dotenv()
@@ -114,6 +114,19 @@ def _format_3a(alert: dict) -> str:
     else:
         next_res_str = _escape_md2("N/A")
 
+    # Fix 3 (Bug 3): a Daily wick spanning multiple stacked MAs now qualifies
+    # independently at every level; the primary (highest-period) level is the
+    # main signal above, and any others are consolidated into one extra line
+    # here rather than sending a separate message per level.
+    also_touched = extra.get("also_touched") or []
+    if also_touched:
+        also_str = ", ".join(
+            f"{_escape_md2(lvl['ma'])} @ {_fmt_price(lvl['value'])}" for lvl in also_touched
+        )
+        also_line = f"Also touched: {also_str}\n"
+    else:
+        also_line = ""
+
     return (
         f"📊 {ticker} — {tf_label} {ma_label} Support Signal\n"
         f"\n"
@@ -127,6 +140,7 @@ def _format_3a(alert: dict) -> str:
         f"\n"
         f"Wick low touched {wick_low}, closed at {price}\n"
         f"Next resistance: {next_res_str}\n"
+        f"{also_line}"
         f"\n"
         f"⚠️ {_escape_md2('Check chart before acting.')}"
     )
@@ -149,15 +163,22 @@ def _format_3b(alert: dict) -> str:
     break_date_str = _fmt_bar_date(extra.get("break_date"))
     first_reclaim_date_str = _fmt_bar_date(extra.get("first_reclaim_date"))
 
-    # Daily: show cascade step change; W/M: omit (no de-escalation)
+    # Daily: show trend status (Fix 5, live close-vs-MA — never a stale
+    # STEP_LABELS claim) and streak-rule copy (Fix 4); W/M: omit (no
+    # de-escalation, no per-MA trend concept at those cadences).
     streak_unit = "days" if tf == "D" else "closes"
     if tf == "D":
-        state_line = (
-            f"Trend status:        {_escape_md2(step_label(prev_step))} "
-            f"→ {_escape_md2(f'now: {step_label(new_step)}')}\n"
-        )
+        trend_status_str = extra.get("trend_status")
+        if trend_status_str is None:
+            # Back-compat for alerts built before Fix 5 (or a caller that
+            # didn't populate it): fall back to the old step-derived text
+            # rather than crashing the formatter.
+            trend_status_str = f"{step_label(prev_step)} → now: {step_label(new_step)}"
+        state_line = f"Trend status:        {_escape_md2(trend_status_str)}\n"
+        streak_rule_line = f"{_escape_md2('Streak rule: closes only — wicks ignored.')}\n"
     else:
         state_line = ""
+        streak_rule_line = ""
 
     price = alert.get("price")
     if price is not None and ma_value:
@@ -169,8 +190,12 @@ def _format_3b(alert: dict) -> str:
     else:
         ma_vs_price_str = _escape_md2("N/A")
 
+    # Fix 1 (Bug 1): direction-derived header instead of the static
+    # SIGNAL_LABELS["3b"] constant — see src/labels.py::directional_breakthrough_label.
+    header_label = _escape_md2(directional_breakthrough_label(price, ma_value))
+
     return (
-        f"✅ {ticker} — {tf_label} {ma_label} {_escape_md2(label_for('3b'))}\n"
+        f"✅ {ticker} — {tf_label} {ma_label} {header_label}\n"
         f"\n"
         f"MA reclaimed:        {ma_label} @ {ma_val}\n"
         f"Consecutive {streak_unit}: {_escape_md2(f'{streak} closes above')}\n"
@@ -180,12 +205,12 @@ def _format_3b(alert: dict) -> str:
         f"Confirmed:           {bar_date_str} {_escape_md2(f'({_ordinal(streak)} consecutive close above — anti-whipsaw passed)')}\n"
         f"MA vs price:         {ma_vs_price_str}\n"
         f"{state_line}"
+        f"{streak_rule_line}"
         f"\n"
         f"{_escape_md2('MA is now acting as support again.')}\n"
         f"\n"
         f"⚠️ {_escape_md2('Check chart before acting.')}"
     )
-
 
 def _format_3c(alert: dict) -> str:
     """Format a 3C Touch Accumulation alert as MarkdownV2."""
@@ -431,6 +456,23 @@ def dispatch_alerts(alerts: list[dict]) -> int:
         if success:
             try:
                 db.insert_alert(alert)
+                # Fix 3 (Bug 3): a consolidated Daily 3A message covers
+                # multiple qualifying MA levels (primary + also_touched).
+                # Only one Telegram message is sent, but the cooldown gate
+                # (db.recent_alert_exists) keys on (ticker, signal_type,
+                # timeframe, ma_period) — so each secondary level also needs
+                # its own alert_log row, or a later scan would re-alert on a
+                # level that was just covered by this consolidated message.
+                also_touched = alert.get("extra", {}).get("also_touched") or []
+                for lvl in also_touched:
+                    try:
+                        also_ma_period = int(str(lvl["ma"]).lstrip("D"))
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    also_alert = dict(alert)
+                    also_alert["ma_period"] = also_ma_period
+                    also_alert["ma_value"] = lvl.get("value")
+                    db.insert_alert(also_alert)
             except Exception as exc:
                 logger.error("Failed to persist alert to DB: %s", exc)
             sent += 1
