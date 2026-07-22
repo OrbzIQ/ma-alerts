@@ -95,6 +95,14 @@ MA_SANITY_MAX_DEVIATION: dict[str, float] = {
 # trading days are considered stale and quarantined rather than sent.
 SANITY_MAX_STALE_TRADING_DAYS: int = 2
 
+# Fix 4: wall-clock budget for the per-ticker scan loop in runner.main(). If
+# elapsed time exceeds this, the loop breaks early (graceful, not a failure)
+# so a long run is visible via an ops alert instead of silently hitting the
+# workflow's own timeout. 1200s = 20 minutes: sits inside the 30-minute
+# workflow timeout, leaving headroom for halt warnings, the deep audit and
+# retention pruning to still run after the break.
+RUN_BUDGET_SECONDS: int = 1200
+
 
 # ---------------------------------------------------------------------------
 # Watchlist

@@ -193,14 +193,29 @@ class _LibsqlBackend:
         self._base_url = url.replace("libsql://", "https://").rstrip("/")
         self._auth_token = auth_token
         self._connected = False
+        self._session = None
+
+    def _get_session(self):
+        """Lazily create and return the shared requests.Session for this backend.
+
+        Reuses one HTTPS connection across all pipeline calls instead of
+        paying a fresh TCP+TLS handshake per request. Auth/content-type
+        headers are set once here rather than passed per-call.
+        """
+        if self._session is None:
+            import requests as _req
+            self._session = _req.Session()
+            self._session.headers.update({
+                "Authorization": f"Bearer {self._auth_token}",
+                "Content-Type": "application/json",
+            })
+        return self._session
 
     def connect(self) -> None:
         """Verify connectivity by running a no-op pipeline request."""
-        import requests as _req
-        resp = _req.post(
+        session = self._get_session()
+        resp = session.post(
             f"{self._base_url}/v2/pipeline",
-            headers={"Authorization": f"Bearer {self._auth_token}",
-                     "Content-Type": "application/json"},
             json={"requests": [{"type": "close"}]},
             timeout=15,
         )
@@ -212,11 +227,9 @@ class _LibsqlBackend:
 
     def _pipeline(self, requests_payload: list[dict]) -> list[dict]:
         """Execute a pipeline of statements and return result sets."""
-        import requests as _req
-        resp = _req.post(
+        session = self._get_session()
+        resp = session.post(
             f"{self._base_url}/v2/pipeline",
-            headers={"Authorization": f"Bearer {self._auth_token}",
-                     "Content-Type": "application/json"},
             json={"requests": requests_payload},
             timeout=30,
         )
@@ -321,6 +334,9 @@ class _LibsqlBackend:
 
     def close(self) -> None:
         self._connected = False
+        if self._session is not None:
+            self._session.close()
+            self._session = None
 
 
 # ---------------------------------------------------------------------------

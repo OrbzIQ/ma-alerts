@@ -393,3 +393,97 @@ class TestMainRebaselineAll:
 
         assert result == 0
         mock_rebaseline.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 -- dispatch_alerts is called per ticker, not once after the loop
+# ---------------------------------------------------------------------------
+
+class TestFix3PerTickerDispatch:
+
+    def test_dispatch_called_per_ticker_and_survives_a_failed_dispatch(self):
+        """
+        With two tickers' worth of alerts, dispatch_alerts must be invoked once
+        per ticker (not once for the whole accumulated list at the end) -- and
+        a raised exception from the first ticker's dispatch must not stop the
+        second ticker from being processed and dispatched.
+        """
+        import src.db as db
+        from src.runner import main
+
+        db.add_watchlist_ticker("BBB", "US")
+        # TEST is already added by the isolated_db fixture -> watchlist is [TEST, BBB].
+
+        alerts_by_ticker = {
+            "TEST": [{"ticker": "TEST", "signal_type": "3A", "timeframe": "D", "ma_period": 50, "extra": {}}],
+            "BBB": [{"ticker": "BBB", "signal_type": "3A", "timeframe": "D", "ma_period": 50, "extra": {}}],
+        }
+
+        def _fake_process_ticker(ticker, market):
+            return alerts_by_ticker.get(ticker, [])
+
+        dispatch_calls = []
+
+        def _fake_dispatch_alerts(alerts):
+            dispatch_calls.append(alerts)
+            if len(dispatch_calls) == 1:
+                raise RuntimeError("simulated Telegram/DB failure on first ticker")
+            return len(alerts)
+
+        with mock.patch("src.runner._process_ticker", side_effect=_fake_process_ticker), \
+             mock.patch(
+                 "src.runner._load_watchlist_from_yaml",
+                 return_value=[{"ticker": "TEST", "market": "US"}, {"ticker": "BBB", "market": "US"}],
+             ), \
+             mock.patch("src.runner._run_deep_drift_audit"), \
+             mock.patch("src.health.check_and_warn_halts", return_value=[]), \
+             mock.patch("src.alerter.dispatch_alerts", side_effect=_fake_dispatch_alerts), \
+             mock.patch.dict(os.environ, {
+                 "TWELVE_DATA_API_KEY": "x", "TURSO_DATABASE_URL": "file:x",
+                 "TURSO_AUTH_TOKEN": "x", "TELEGRAM_BOT_TOKEN": "x", "TELEGRAM_CHAT_ID": "x",
+             }):
+            result = main("US")
+
+        assert result == 0
+        # One dispatch call per ticker, not one call for the whole batch.
+        assert len(dispatch_calls) == 2
+        assert dispatch_calls[0] == alerts_by_ticker["TEST"]
+        assert dispatch_calls[1] == alerts_by_ticker["BBB"]
+
+
+# ---------------------------------------------------------------------------
+# Fix 4 -- wall-clock budget guard breaks the loop early
+# ---------------------------------------------------------------------------
+
+class TestFix4RunBudgetGuard:
+
+    def test_budget_of_zero_breaks_before_processing_any_ticker(self):
+        """
+        With RUN_BUDGET_SECONDS patched to 0, the very first budget check
+        (top of the first loop iteration) must already be over budget, so
+        the loop breaks immediately -- no ticker is processed -- and the run
+        still completes and returns 0 (graceful early stop, not a failure).
+        """
+        import src.db as db
+        from src.runner import main
+
+        db.add_watchlist_ticker("BBB", "US")
+
+        with mock.patch("src.config.RUN_BUDGET_SECONDS", 0), \
+             mock.patch("src.runner._process_ticker") as mock_process, \
+             mock.patch(
+                 "src.runner._load_watchlist_from_yaml",
+                 return_value=[{"ticker": "TEST", "market": "US"}, {"ticker": "BBB", "market": "US"}],
+             ), \
+             mock.patch("src.runner._run_deep_drift_audit"), \
+             mock.patch("src.health.check_and_warn_halts", return_value=[]), \
+             mock.patch("src.alerter.send_ops_message") as mock_ops, \
+             mock.patch.dict(os.environ, {
+                 "TWELVE_DATA_API_KEY": "x", "TURSO_DATABASE_URL": "file:x",
+                 "TURSO_AUTH_TOKEN": "x", "TELEGRAM_BOT_TOKEN": "x", "TELEGRAM_CHAT_ID": "x",
+             }):
+            result = main("US")
+
+        assert result == 0
+        mock_process.assert_not_called()
+        assert any("run-budget exceeded" in call.args[0] for call in mock_ops.call_args_list)

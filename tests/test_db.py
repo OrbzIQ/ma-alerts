@@ -272,3 +272,54 @@ class TestDeepAuditRotation:
             db.add_watchlist_ticker(t, "US")
         due = db.get_tickers_for_deep_audit(3)
         assert len(due) == 3
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 -- _LibsqlBackend reuses one requests.Session across pipeline calls
+# ---------------------------------------------------------------------------
+
+class TestLibsqlBackendSessionReuse:
+
+    def test_pipeline_calls_reuse_same_session_and_close_clears_it(self, monkeypatch):
+        """
+        Two successive _pipeline() calls must reuse the same requests.Session
+        instance (transport-only change -- removes the fresh TCP+TLS handshake
+        per Turso round trip), and close() must clear it so a later
+        get_connection() can still create a fresh one.
+        """
+        import src.db as db
+
+        created_sessions = []
+
+        class _FakeResponse:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {"results": []}
+
+        class _FakeSession:
+            def __init__(self):
+                self.headers = {}
+                self.closed = False
+                created_sessions.append(self)
+
+            def post(self, *args, **kwargs):
+                return _FakeResponse()
+
+            def close(self):
+                self.closed = True
+
+        monkeypatch.setattr("requests.Session", _FakeSession)
+
+        backend = db._LibsqlBackend("libsql://example.turso.io", "test-token")
+
+        backend._pipeline([{"type": "execute", "stmt": {"sql": "SELECT 1"}}])
+        backend._pipeline([{"type": "execute", "stmt": {"sql": "SELECT 2"}}])
+
+        assert len(created_sessions) == 1, "second _pipeline call must reuse the existing session"
+        assert backend._session is created_sessions[0]
+
+        backend.close()
+        assert backend._session is None
+        assert created_sessions[0].closed is True

@@ -39,6 +39,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from datetime import date, datetime, timedelta
 
 from dotenv import load_dotenv
@@ -540,7 +541,7 @@ def main(market: str) -> int:
 
         import src.db as db
         from src.alerter import dispatch_alerts, send_ops_message
-        from src.config import OHLCV_RETENTION_YEARS, TOUCH_WINDOW_DAYS
+        from src.config import OHLCV_RETENTION_YEARS, RUN_BUDGET_SECONDS, TOUCH_WINDOW_DAYS
         from src.health import check_and_warn_halts
 
         # 2. Init schema
@@ -571,13 +572,53 @@ def main(market: str) -> int:
         # 4. Process tickers
         all_alerts: list[dict] = []
         scan_errors = 0
+        sent = 0
+        _loop_start = time.monotonic()
 
-        for entry in watchlist:
+        for _i, entry in enumerate(watchlist):
+            # Fix 4: wall-clock budget guard. If the loop has been running
+            # longer than RUN_BUDGET_SECONDS, stop picking up new tickers —
+            # graceful early stop, not a failure — and let the rest of the
+            # pipeline (halt sweep, deep audit, pruning, summary) still run.
+            if time.monotonic() - _loop_start > RUN_BUDGET_SECONDS:
+                _remaining = [e["ticker"] for e in watchlist[_i:]]
+                _elapsed = time.monotonic() - _loop_start
+                logger.error(
+                    "Run budget exceeded (%.0fs > %ds) — stopping with %d ticker(s) unscanned",
+                    _elapsed, RUN_BUDGET_SECONDS, len(_remaining),
+                )
+                try:
+                    _shown = _remaining[:10]
+                    _more_note = f" +{len(_remaining) - 10} more" if len(_remaining) > 10 else ""
+                    send_ops_message(
+                        f"[OPS] scan run-budget exceeded ({_elapsed:.0f}s > "
+                        f"{RUN_BUDGET_SECONDS}s) — {len(_remaining)} ticker(s) unscanned this run: "
+                        f"{', '.join(_shown)}{_more_note}"
+                    )
+                except Exception as exc:
+                    logger.error("Failed to send run-budget ops alert: %s", exc)
+                break
+
             ticker = entry["ticker"]
             try:
                 ticker_alerts = _process_ticker(ticker, market)
                 all_alerts.extend(ticker_alerts)
                 _tickers_processed += 1
+
+                # Fix 3: dispatch each ticker's alerts immediately rather than
+                # accumulating everything for a single post-loop dispatch. If
+                # the run is killed mid-loop (e.g. the workflow timeout), any
+                # ticker already processed has had its alerts delivered —
+                # nothing is discarded wholesale. Safe because dispatch_alerts
+                # gates on (ticker, signal_type, timeframe, ma_period), all
+                # ticker-scoped, so dispatching earlier cannot change any
+                # other ticker's detection.
+                try:
+                    sent += dispatch_alerts(ticker_alerts)
+                except Exception as exc:
+                    logger.error(
+                        "Dispatch failed for %s (continuing scan): %s", ticker, exc
+                    )
             except Exception as exc:
                 logger.error("Unexpected exception for %s (should have been caught): %s", ticker, exc)
                 scan_errors += 1
@@ -605,8 +646,8 @@ def main(market: str) -> int:
         if halt_warnings:
             logger.warning("Halt warnings dispatched for: %s", ", ".join(halt_warnings))
 
-        # 6 + 7. Dispatch alerts (persists to alert_log on success)
-        sent = dispatch_alerts(all_alerts)
+        # 6 + 7. Dispatch already happened per-ticker inside the loop above
+        # (Fix 3) — this just reports the accumulated totals.
         logger.info("Dispatched %d / %d alerts", sent, len(all_alerts))
 
         # 8. Retention pruning
